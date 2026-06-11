@@ -31,6 +31,9 @@ The dispatcher must not answer the user, rewrite the request, change intent, or 
 - `packages/cli/` - command-line utilities for route tests, evals, and diagnostics.
 - `skills/` - optional Codex skills for analysis, evaluation, and local model benchmarking.
 - `docs/` - methodology, deployment, and evaluation notes.
+- `reports/` - publishable research and methodology writeups.
+
+Start with [PETO: Personalized Effort and Tokenomics Optimization](reports/peto-personalized-effort-tokenomics-optimization.md).
 
 ## Recommended Data-Test Config
 
@@ -71,4 +74,3 @@ Effort review: uncertain, monitor next.
 ## Status
 
 This repo is a research and data-testing scaffold. It is not yet a packaged release.
-
