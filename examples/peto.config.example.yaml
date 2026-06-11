@@ -1,0 +1,33 @@
+dispatcher:
+  provider: openai-compatible
+  base_url: "https://example.com/v1"
+  model: "gpt-5.4-mini"
+  effort: "low"
+  max_output_tokens: 220
+
+executor:
+  provider: openai-compatible
+  base_url: "https://example.com/v1"
+  model: "gpt-5.5"
+
+routing:
+  mode: "effort_only"
+  allowed_efforts: ["minimal", "low", "medium", "high", "xhigh"]
+  max_router_user_text_chars: 3000
+  max_retrieved_notes: 2
+
+memory:
+  type: "llmwiki"
+  path: "./memory"
+
+review:
+  visible_effort_review_words: 5
+  write_full_review_when:
+    - "underfit"
+    - "overfit"
+    - "rejection"
+    - "retry"
+    - "escalation"
+    - "cost_anomaly"
+    - "reusable_lesson"
+
