@@ -23,11 +23,13 @@ every message
 
 The dispatcher must not answer the user, rewrite the request, change intent, or choose hidden requirements.
 
+Important: a tool or MCP server cannot guarantee every-message pre-inference routing, because the assistant has to run before it can call a tool. Use the gateway as the dispatch layer; use MCP/tools for support and observability.
+
 ## Core Components
 
 - `packages/core/` - routing schemas, evaluation logic, and memory interfaces.
 - `packages/gateway/` - OpenAI-compatible proxy for clients that can point at a custom `base_url`; includes the reference dispatcher gateway.
-- `packages/mcp/` - MCP adapter for agents that cannot use a proxy.
+- `packages/mcp/` - support tools for route inspection, outcome logging, savings estimates, and lesson writing.
 - `packages/cli/` - command-line utilities for route tests, evals, and diagnostics.
 - `skills/` - optional Codex skills for analysis, evaluation, and local model benchmarking.
 - `docs/` - methodology, deployment, and evaluation notes.

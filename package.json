@@ -1,0 +1,13 @@
+{
+  "name": "peto",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Personalized Effort and Tokenomics Optimization research scaffold.",
+  "scripts": {
+    "check": "node --check packages/gateway/router-gateway.mjs && node --check packages/mcp/peto-mcp-server.mjs",
+    "gateway": "node packages/gateway/router-gateway.mjs",
+    "mcp": "node packages/mcp/peto-mcp-server.mjs"
+  }
+}
+

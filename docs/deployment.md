@@ -60,14 +60,20 @@ packages/gateway/router-gateway.mjs
 
 ### MCP Adapter
 
-Best for agents that cannot use a proxy.
+Best for support tasks: inspection, outcome logging, savings estimates, lesson writing, and offline evaluation. MCP is not the primary every-message dispatcher because a model must already be running before it can choose to call a tool.
 
 Suggested tools:
 
-- `peto_route`
+- `peto_latest_route`
 - `peto_log_outcome`
 - `peto_estimate_savings`
 - `peto_write_lesson`
+
+The reference MCP server lives at:
+
+```text
+packages/mcp/peto-mcp-server.mjs
+```
 
 ### CLI Adapter
 
