@@ -219,7 +219,7 @@ function extractResponseText(responseBody) {
   return parts.join("\n");
 }
 
-async function callRouter({ headers, userText, notes }) {
+async function callHostedRouter({ headers, userText, notes }) {
   const body = {
     model: config.routerModel,
     input: buildRouterPrompt(userText, notes),
@@ -260,7 +260,59 @@ async function callRouter({ headers, userText, notes }) {
       needs_review: Boolean(route.needs_review),
     },
     usage: parsed.usage ?? null,
+    sourceDetail: "openai_responses",
   };
+}
+
+async function callLocalRouter({ userText, notes }) {
+  const url = config.localRouterUrl || "http://127.0.0.1:8788/route";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.localRouterTimeoutMs || 8000);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    signal: controller.signal,
+    body: JSON.stringify({
+      user_text: userText,
+      notes,
+      allowed_efforts: config.allowedEfforts || ["minimal", "low", "medium", "high", "xhigh"],
+      max_user_text_chars: config.maxRouterUserTextChars || 3000,
+    }),
+  }).finally(() => clearTimeout(timeout));
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`Local router call failed with ${response.status}: ${raw.slice(0, 500)}`);
+  }
+
+  const route = JSON.parse(raw);
+  const effort = String(route.target_effort || "").toLowerCase();
+  if (!(config.allowedEfforts || ["minimal", "low", "medium", "high", "xhigh"]).includes(effort)) {
+    throw new Error(`Local router chose disallowed effort: ${route.target_effort}`);
+  }
+
+  return {
+    route: {
+      target_effort: effort,
+      confidence: Number(route.confidence ?? 0),
+      rationale_short: String(route.rationale_short || "No rationale returned.").slice(0, 240),
+      recording_priority: String(route.recording_priority || "normal"),
+      needs_review: Boolean(route.needs_review),
+      source: String(route.source || "local_http"),
+    },
+    usage: route.usage ?? null,
+    sourceDetail: String(route.source || "local_http"),
+  };
+}
+
+async function callRouter({ headers, userText, notes }) {
+  if ((config.routerBackend || "openai_responses") === "local_http") {
+    return callLocalRouter({ userText, notes });
+  }
+  return callHostedRouter({ headers, userText, notes });
 }
 
 function applyRoute(body, route) {
@@ -311,12 +363,14 @@ function detectDispleasure(text) {
   return patterns.some(pattern => pattern.test(lowered)) && aimedAtAssistant.some(pattern => pattern.test(text));
 }
 
-function logRouteStart({ id, userText, incomingBody, route, routeSource, routeUsage, notes }) {
+function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSourceDetail, routeUsage, notes }) {
   const logPath = config.logPath || path.join(memoryPath, "dispatcher/logs/router-events.jsonl");
   appendJsonl(logPath, {
     id,
     phase: "request",
     route_source: routeSource,
+    route_source_detail: routeSourceDetail ?? route.source ?? null,
+    router_backend: config.routerBackend || "openai_responses",
     input_hash: hashText(userText),
     user_excerpt: userText.slice(0, 500),
     incoming_model: incomingBody.model ?? null,
@@ -446,13 +500,16 @@ async function handleResponses(req, res) {
   let route;
   let routeUsage = null;
   let routeSource = "router";
+  let routeSourceDetail = null;
 
   try {
     const routed = await callRouter({ headers: req.headers, userText, notes });
     route = routed.route;
     routeUsage = routed.usage;
+    routeSourceDetail = routed.sourceDetail ?? routed.route?.source ?? null;
   } catch (error) {
     routeSource = "fallback";
+    routeSourceDetail = "gateway_default";
     route = {
       target_effort: config.defaultEffort || "medium",
       confidence: 0,
@@ -464,7 +521,7 @@ async function handleResponses(req, res) {
   }
 
   const routedBody = applyRoute(originalBody, route);
-  logRouteStart({ id, userText, incomingBody: originalBody, route, routeSource, routeUsage, notes });
+  logRouteStart({ id, userText, incomingBody: originalBody, route, routeSource, routeSourceDetail, routeUsage, notes });
 
   try {
     const complete = await forwardToUpstream(req, res, routedBody);
@@ -503,8 +560,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/health") {
       responseJson(res, 200, {
         ok: true,
+        router_backend: config.routerBackend || "openai_responses",
         router_model: config.routerModel,
         router_effort: config.routerEffort || "low",
+        local_router_url: config.localRouterUrl || null,
         default_effort: config.defaultEffort || "medium",
         upstream: config.upstreamBaseUrl,
       });
@@ -538,10 +597,10 @@ server.on("clientError", (error, socket) => {
 server.listen(config.port || 8787, config.host || "127.0.0.1", () => {
   logServer("router gateway started", {
     port: config.port || 8787,
+    router_backend: config.routerBackend || "openai_responses",
     router_model: config.routerModel,
     router_effort: config.routerEffort || "low",
     upstream: config.upstreamBaseUrl,
   });
   console.log(`PETO router gateway listening on http://${config.host || "127.0.0.1"}:${config.port || 8787}`);
 });
-

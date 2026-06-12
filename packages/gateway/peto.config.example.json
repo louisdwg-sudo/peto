@@ -5,8 +5,11 @@
   "mode": "effort_only",
   "defaultTargetModel": "gpt-5.5",
   "defaultEffort": "medium",
-  "routerModel": "gpt-5.4-mini",
-  "routerEffort": "low",
+  "routerBackend": "local_http",
+  "localRouterUrl": "http://127.0.0.1:8788/route",
+  "routerModel": "Qwen2.5-1.5B-Instruct-local",
+  "routerEffort": "local",
+  "localRouterTimeoutMs": 8000,
   "routerMaxOutputTokens": 220,
   "allowedEfforts": ["minimal", "low", "medium", "high", "xhigh"],
   "enableSimpleMemoryRetrieval": true,
@@ -25,4 +28,3 @@
   "serverLogPath": "./memory/dispatcher/logs/router-server.jsonl",
   "feedbackPath": "./memory/dispatcher/logs/feedback-signals.jsonl"
 }
-

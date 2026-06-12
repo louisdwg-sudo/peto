@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.peto.local-qwen-dispatcher</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/python</string>
+    <string>/path/to/PETO Research/packages/dispatcher/local-qwen-dispatcher.py</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8789</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>QWEN_MODEL_DIR</key>
+    <string>/path/to/Qwen2.5-1.5B-Instruct</string>
+    <key>PETO_QWEN_DTYPE</key>
+    <string>float16</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/peto-local-qwen-dispatcher.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/peto-local-qwen-dispatcher.err.log</string>
+</dict>
+</plist>

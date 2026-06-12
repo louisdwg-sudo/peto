@@ -11,7 +11,7 @@ A skill can guide agent behavior, but it usually cannot intercept every model ca
 ```text
 client
 -> PETO gateway
--> dispatcher model
+-> dispatcher model or local dispatcher service
 -> executor model
 -> telemetry log
 ```
@@ -20,8 +20,9 @@ Configuration:
 
 ```yaml
 dispatcher:
-  model: gpt-5.4-mini
-  effort: low
+  backend: local_http
+  model: Qwen2.5-1.5B-Instruct-local
+  url: http://127.0.0.1:8788/route
 
 executor:
   model: gpt-5.5
@@ -46,7 +47,7 @@ Responsibilities:
 
 - receive the original request
 - retrieve a small number of relevant routing lessons
-- call the dispatcher
+- call the dispatcher backend
 - validate route JSON
 - rewrite only effort metadata
 - forward the original request unchanged
@@ -57,6 +58,44 @@ The reference gateway lives at:
 ```text
 packages/gateway/router-gateway.mjs
 ```
+
+### Local Qwen Dispatcher
+
+Best for PETO v1 data testing when the dispatcher must run on every message without depending on a hosted mini model.
+
+Responsibilities:
+
+- load Qwen once and keep it warm
+- receive route-only JSON requests from the gateway
+- choose `target_effort`
+- return strict route metadata
+- fall back to deterministic heuristics if the small model emits invalid JSON
+
+The reference local dispatcher lives at:
+
+```text
+packages/dispatcher/local-qwen-dispatcher.py
+```
+
+Start it before the gateway:
+
+```bash
+export QWEN_MODEL_DIR="/path/to/Qwen2.5-1.5B-Instruct"
+PETO_QWEN_PYTHON="/path/to/python" PETO_QWEN_PORT=8789 \
+  packages/dispatcher/start-local-qwen-dispatcher.sh
+```
+
+Then configure the gateway with:
+
+```json
+{
+  "routerBackend": "local_http",
+  "localRouterUrl": "http://127.0.0.1:8789/route",
+  "routerModel": "Qwen2.5-1.5B-Instruct-local"
+}
+```
+
+For local machines that already use port `8788`, use `8789` or any free localhost port and keep `localRouterUrl` aligned with `PETO_QWEN_PORT`.
 
 ### MCP Adapter
 

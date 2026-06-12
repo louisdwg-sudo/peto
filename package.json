@@ -5,9 +5,9 @@
   "type": "module",
   "description": "Personalized Effort and Tokenomics Optimization research scaffold.",
   "scripts": {
-    "check": "node --check packages/gateway/router-gateway.mjs && node --check packages/mcp/peto-mcp-server.mjs",
+    "check": "node --check packages/gateway/router-gateway.mjs && node --check packages/mcp/peto-mcp-server.mjs && python3 -m py_compile packages/dispatcher/local-qwen-dispatcher.py",
+    "dispatcher:qwen": "python3 packages/dispatcher/local-qwen-dispatcher.py",
     "gateway": "node packages/gateway/router-gateway.mjs",
     "mcp": "node packages/mcp/peto-mcp-server.mjs"
   }
 }
-
