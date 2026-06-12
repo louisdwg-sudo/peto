@@ -1,0 +1,28 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "upstreamBaseUrl": "https://api.example.com",
+  "mode": "effort_only",
+  "defaultTargetModel": "gpt-5.5",
+  "defaultEffort": "medium",
+  "routerModel": "gpt-5.4-mini",
+  "routerEffort": "low",
+  "routerMaxOutputTokens": 220,
+  "allowedEfforts": ["minimal", "low", "medium", "high", "xhigh"],
+  "enableSimpleMemoryRetrieval": true,
+  "memoryPath": "./memory",
+  "memorySearchRoots": [
+    "dispatcher/lessons",
+    "dispatcher/policy",
+    "user/preferences",
+    "user/mistake-patterns"
+  ],
+  "maxRetrievedNotes": 2,
+  "maxRouterUserTextChars": 3000,
+  "maxRouterNoteChars": 240,
+  "requestBodyLimitBytes": 25000000,
+  "logPath": "./memory/dispatcher/logs/router-events.jsonl",
+  "serverLogPath": "./memory/dispatcher/logs/router-server.jsonl",
+  "feedbackPath": "./memory/dispatcher/logs/feedback-signals.jsonl"
+}
+

@@ -52,6 +52,12 @@ Responsibilities:
 - forward the original request unchanged
 - log request and response telemetry
 
+The reference gateway lives at:
+
+```text
+packages/gateway/router-gateway.mjs
+```
+
 ### MCP Adapter
 
 Best for agents that cannot use a proxy.
@@ -81,4 +87,3 @@ Best for Codex behavior and review discipline. A skill should complement the gat
 ## Public Config Principle
 
 Do not hardcode personal paths, API keys, or model names. Publish examples with placeholders and allow users to swap in local or hosted dispatcher models.
-

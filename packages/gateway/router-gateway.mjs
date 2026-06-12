@@ -1,0 +1,547 @@
+#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import { URL } from "node:url";
+import crypto from "node:crypto";
+
+const defaultConfigPath = path.resolve("peto.config.json");
+const configPath = process.env.PETO_CONFIG
+  ? path.resolve(process.env.PETO_CONFIG)
+  : defaultConfigPath;
+
+function loadConfig() {
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`Missing config file: ${configPath}. Set PETO_CONFIG or create peto.config.json.`);
+  }
+  return JSON.parse(fs.readFileSync(configPath, "utf8"));
+}
+
+const config = loadConfig();
+const memoryPath = path.resolve(config.memoryPath || "./memory");
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function appendJsonl(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${JSON.stringify({ timestamp: nowIso(), ...data })}\n`);
+}
+
+function logServer(message, extra = {}) {
+  appendJsonl(config.serverLogPath || path.join(memoryPath, "logs/server.jsonl"), { message, ...extra });
+}
+
+function hashText(text) {
+  return crypto.createHash("sha256").update(text || "").digest("hex").slice(0, 16);
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    const limit = config.requestBodyLimitBytes || 25_000_000;
+    req.on("data", chunk => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error(`Request body exceeds ${limit} bytes`));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function responseJson(res, status, data) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(data));
+}
+
+function normalizeTextPart(part) {
+  if (typeof part === "string") return part;
+  if (!part || typeof part !== "object") return "";
+  if (typeof part.text === "string") return part.text;
+  if (typeof part.content === "string") return part.content;
+  if (typeof part.input_text === "string") return part.input_text;
+  if (typeof part.output_text === "string") return part.output_text;
+  return "";
+}
+
+function extractTextFromMessage(message) {
+  if (typeof message === "string") return message;
+  if (!message || typeof message !== "object") return "";
+  const content = message.content ?? message.input ?? message.text;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(normalizeTextPart).filter(Boolean).join("\n");
+  return normalizeTextPart(content);
+}
+
+function extractLatestUserText(body) {
+  const input = body?.input ?? body?.messages;
+  if (typeof input === "string") return input;
+  if (!Array.isArray(input)) return "";
+
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (!item || typeof item !== "object") continue;
+    const role = item.role ?? item.type;
+    if (role === "user" || role === "message") {
+      const text = extractTextFromMessage(item).trim();
+      if (text) return text;
+    }
+  }
+
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const text = extractTextFromMessage(input[index]).trim();
+    if (text) return text;
+  }
+
+  return "";
+}
+
+function words(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ")
+    .split(/\s+/)
+    .filter(word => word.length >= 2)
+    .slice(0, 120);
+}
+
+function listMarkdownFiles(dir) {
+  const output = [];
+  if (!fs.existsSync(dir)) return output;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) output.push(...listMarkdownFiles(full));
+    if (entry.isFile() && entry.name.endsWith(".md")) output.push(full);
+  }
+  return output;
+}
+
+function retrieveMemoryNotes(userText) {
+  if (config.enableSimpleMemoryRetrieval === false) return [];
+
+  const terms = new Set(words(userText));
+  if (terms.size === 0) return [];
+
+  const roots = config.memorySearchRoots || [
+    "dispatcher/lessons",
+    "dispatcher/policy",
+    "user/preferences",
+    "user/mistake-patterns",
+  ];
+
+  const scored = [];
+  for (const file of roots.map(root => path.join(memoryPath, root)).flatMap(listMarkdownFiles)) {
+    const text = fs.readFileSync(file, "utf8");
+    const lower = text.toLowerCase();
+    let score = 0;
+    for (const term of terms) {
+      if (lower.includes(term)) score += 1;
+    }
+    if (score > 0) {
+      scored.push({
+        file: path.relative(memoryPath, file),
+        score,
+        excerpt: text.replace(/\s+/g, " ").slice(0, config.maxRouterNoteChars || 240),
+      });
+    }
+  }
+
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, config.maxRetrievedNotes || 2);
+}
+
+function stripHopByHopHeaders(headers) {
+  const next = {};
+  const blocked = new Set([
+    "host",
+    "connection",
+    "content-length",
+    "accept-encoding",
+    "transfer-encoding",
+    "upgrade",
+  ]);
+  for (const [key, value] of Object.entries(headers)) {
+    if (!blocked.has(key.toLowerCase()) && value !== undefined) next[key] = value;
+  }
+  return next;
+}
+
+function upstreamUrl(reqUrl) {
+  const upstream = new URL(config.upstreamBaseUrl);
+  const incoming = new URL(reqUrl, "http://localhost");
+  const cleanBase = upstream.pathname.replace(/\/+$/, "");
+  const cleanIncoming = incoming.pathname.startsWith("/") ? incoming.pathname : `/${incoming.pathname}`;
+  upstream.pathname = `${cleanBase}${cleanIncoming}`;
+  upstream.search = incoming.search;
+  return upstream;
+}
+
+function buildRouterPrompt(userText, notes) {
+  return [
+    "Effort router. Do not answer or rewrite the user request.",
+    "Pick the cheapest effort likely to satisfy the user. Use high/xhigh only when avoided rework justifies it.",
+    "V1 is effort-only: do not switch executor models, call an arbiter, or add hidden requirements.",
+    'Return only JSON: {"target_effort":"minimal|low|medium|high|xhigh","confidence":0.0,"rationale_short":"short reason","recording_priority":"skip|normal|watch|lesson_candidate","needs_review":false}',
+    "Notes:",
+    notes.length ? JSON.stringify(notes, null, 2) : "[]",
+    "User:",
+    userText.slice(0, config.maxRouterUserTextChars || 3000),
+  ].join("\n");
+}
+
+function parseRouterJson(text) {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("Router returned no JSON object");
+  return JSON.parse(match[0]);
+}
+
+function extractResponseText(responseBody) {
+  if (typeof responseBody?.output_text === "string") return responseBody.output_text;
+  const output = responseBody?.output;
+  if (!Array.isArray(output)) return "";
+  const parts = [];
+  for (const item of output) {
+    const content = item?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      const text = part?.text ?? part?.output_text;
+      if (typeof text === "string") parts.push(text);
+    }
+  }
+  return parts.join("\n");
+}
+
+async function callRouter({ headers, userText, notes }) {
+  const body = {
+    model: config.routerModel,
+    input: buildRouterPrompt(userText, notes),
+    reasoning: { effort: config.routerEffort || "low" },
+    max_output_tokens: config.routerMaxOutputTokens || 220,
+  };
+
+  const url = new URL("/v1/responses", config.upstreamBaseUrl);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...stripHopByHopHeaders(headers),
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`Router call failed with ${response.status}: ${raw.slice(0, 500)}`);
+  }
+
+  const parsed = JSON.parse(raw);
+  const text = extractResponseText(parsed);
+  const route = parseRouterJson(text);
+  const effort = String(route.target_effort || "").toLowerCase();
+  if (!(config.allowedEfforts || ["minimal", "low", "medium", "high", "xhigh"]).includes(effort)) {
+    throw new Error(`Router chose disallowed effort: ${route.target_effort}`);
+  }
+
+  return {
+    route: {
+      target_effort: effort,
+      confidence: Number(route.confidence ?? 0),
+      rationale_short: String(route.rationale_short || "No rationale returned.").slice(0, 240),
+      recording_priority: String(route.recording_priority || "normal"),
+      needs_review: Boolean(route.needs_review),
+    },
+    usage: parsed.usage ?? null,
+  };
+}
+
+function applyRoute(body, route) {
+  const next = structuredClone(body);
+  const incomingModel = typeof next.model === "string" ? next.model : config.defaultTargetModel;
+  next.model = config.mode === "effort_only" ? incomingModel : config.defaultTargetModel;
+  next.reasoning = {
+    ...(next.reasoning || {}),
+    effort: route.target_effort || config.defaultEffort || "medium",
+  };
+  return next;
+}
+
+function detectDispleasure(text) {
+  const lowered = text.toLowerCase();
+  const aimedAtAssistant = [
+    /\byour (answer|output|response|reply|work)\b/i,
+    /\byou (missed|failed|got|made|did|are)\b/i,
+    /\bthis (answer|output|response|reply|is|was)\b/i,
+    /\bthat (answer|output|response|reply|is|was)\b/i,
+    /\bnot what i (want|asked|asked for)\b/i,
+    /\btry again\b/i,
+    /\bredo\b/i,
+    /你/,
+    /回答/,
+    /输出/,
+    /重来/,
+  ];
+  const isLikelyQuoted = /```|^>|"[^"]*(shit|sucks|trash|rubbish|reject|redo)[^"]*"/ims.test(text);
+  if (isLikelyQuoted && !aimedAtAssistant.some(pattern => pattern.test(text))) return false;
+  const patterns = [
+    /\bshit\b/i,
+    /\bsucks?\b/i,
+    /\btrash\b/i,
+    /\bthrash\b/i,
+    /\brubbish\b/i,
+    /\breject\b/i,
+    /\bredo\b/i,
+    /not\s+right/i,
+    /not\s+what\s+i\s+(want|asked|asked for)/i,
+    /没理解/,
+    /不对/,
+    /重来/,
+    /垃圾/,
+    /烂/,
+    /不满意/,
+  ];
+  return patterns.some(pattern => pattern.test(lowered)) && aimedAtAssistant.some(pattern => pattern.test(text));
+}
+
+function logRouteStart({ id, userText, incomingBody, route, routeSource, routeUsage, notes }) {
+  const logPath = config.logPath || path.join(memoryPath, "dispatcher/logs/router-events.jsonl");
+  appendJsonl(logPath, {
+    id,
+    phase: "request",
+    route_source: routeSource,
+    input_hash: hashText(userText),
+    user_excerpt: userText.slice(0, 500),
+    incoming_model: incomingBody.model ?? null,
+    incoming_effort: incomingBody.reasoning?.effort ?? null,
+    chosen_model: incomingBody.model ?? config.defaultTargetModel,
+    chosen_effort: route.target_effort,
+    router_model: config.routerModel,
+    router_effort: config.routerEffort || "low",
+    router_confidence: route.confidence ?? null,
+    router_rationale: route.rationale_short ?? null,
+    router_usage: routeUsage,
+    retrieved_notes: notes.map(note => note.file),
+    feedback_signal: detectDispleasure(userText),
+  });
+
+  if (detectDispleasure(userText)) {
+    appendJsonl(config.feedbackPath || path.join(memoryPath, "dispatcher/logs/feedback-signals.jsonl"), {
+      id,
+      input_hash: hashText(userText),
+      user_excerpt: userText.slice(0, 500),
+      signal: "explicit_displeasure",
+    });
+  }
+}
+
+function logRouteComplete({ id, status, statusCode, latencyMs, usage, error }) {
+  appendJsonl(config.logPath || path.join(memoryPath, "dispatcher/logs/router-events.jsonl"), {
+    id,
+    phase: "response",
+    status,
+    status_code: statusCode ?? null,
+    latency_ms: latencyMs,
+    usage: usage ?? null,
+    error: error ? String(error).slice(0, 800) : null,
+  });
+}
+
+function parseSseUsage(buffer) {
+  let usage = null;
+  const events = buffer.split(/\n\n+/);
+  for (const event of events) {
+    const dataLines = event
+      .split(/\n/)
+      .filter(line => line.startsWith("data:"))
+      .map(line => line.slice(5).trim())
+      .filter(line => line && line !== "[DONE]");
+    for (const line of dataLines) {
+      try {
+        const parsed = JSON.parse(line);
+        const candidate = parsed?.response?.usage ?? parsed?.usage;
+        if (candidate) usage = candidate;
+      } catch {
+        // Ignore non-JSON stream fragments.
+      }
+    }
+  }
+  return usage;
+}
+
+async function forwardToUpstream(req, res, body) {
+  const started = Date.now();
+  const url = upstreamUrl(req.url);
+  const upstreamHeaders = {
+    ...stripHopByHopHeaders(req.headers),
+    "content-type": "application/json",
+  };
+
+  const response = await fetch(url, {
+    method: req.method,
+    headers: upstreamHeaders,
+    body: JSON.stringify(body),
+  });
+
+  const responseHeaders = {};
+  response.headers.forEach((value, key) => {
+    if (!["content-encoding", "content-length", "transfer-encoding"].includes(key.toLowerCase())) {
+      responseHeaders[key] = value;
+    }
+  });
+  res.writeHead(response.status, responseHeaders);
+
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("text/event-stream") && response.body) {
+    let streamText = "";
+    for await (const chunk of response.body) {
+      const buffer = Buffer.from(chunk);
+      streamText += buffer.toString("utf8");
+      res.write(buffer);
+    }
+    res.end();
+    return {
+      statusCode: response.status,
+      latencyMs: Date.now() - started,
+      usage: parseSseUsage(streamText),
+    };
+  }
+
+  const raw = await response.text();
+  res.end(raw);
+  let usage = null;
+  try {
+    usage = JSON.parse(raw)?.usage ?? null;
+  } catch {
+    // Ignore non-JSON response.
+  }
+  return {
+    statusCode: response.status,
+    latencyMs: Date.now() - started,
+    usage,
+  };
+}
+
+async function handleResponses(req, res) {
+  const id = crypto.randomUUID();
+  let raw;
+  let originalBody;
+  try {
+    raw = await readRequestBody(req);
+    originalBody = JSON.parse(raw || "{}");
+  } catch (error) {
+    responseJson(res, 400, { error: { message: error.message } });
+    return;
+  }
+
+  const userText = extractLatestUserText(originalBody);
+  const notes = retrieveMemoryNotes(userText);
+  let route;
+  let routeUsage = null;
+  let routeSource = "router";
+
+  try {
+    const routed = await callRouter({ headers: req.headers, userText, notes });
+    route = routed.route;
+    routeUsage = routed.usage;
+  } catch (error) {
+    routeSource = "fallback";
+    route = {
+      target_effort: config.defaultEffort || "medium",
+      confidence: 0,
+      rationale_short: `Router unavailable; used default ${config.defaultEffort || "medium"}.`,
+      recording_priority: "watch",
+      needs_review: true,
+    };
+    logServer("router call failed", { id, error: error.message });
+  }
+
+  const routedBody = applyRoute(originalBody, route);
+  logRouteStart({ id, userText, incomingBody: originalBody, route, routeSource, routeUsage, notes });
+
+  try {
+    const complete = await forwardToUpstream(req, res, routedBody);
+    logRouteComplete({ id, status: "success", ...complete });
+  } catch (error) {
+    logRouteComplete({ id, status: "error", latencyMs: null, error: error.message });
+    if (!res.headersSent) {
+      responseJson(res, 502, { error: { message: error.message } });
+    } else {
+      res.end();
+    }
+  }
+}
+
+async function handleDryRun(req, res) {
+  const raw = await readRequestBody(req);
+  const body = JSON.parse(raw || "{}");
+  const userText = extractLatestUserText(body);
+  const notes = retrieveMemoryNotes(userText);
+  const route = {
+    target_effort: config.defaultEffort || "medium",
+    confidence: 0,
+    rationale_short: "Dry run does not call router.",
+    recording_priority: "normal",
+    needs_review: false,
+  };
+  responseJson(res, 200, {
+    user_excerpt: userText.slice(0, 500),
+    retrieved_notes: notes.map(note => note.file),
+    would_apply: applyRoute(body, route),
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (req.method === "GET" && req.url === "/health") {
+      responseJson(res, 200, {
+        ok: true,
+        router_model: config.routerModel,
+        router_effort: config.routerEffort || "low",
+        default_effort: config.defaultEffort || "medium",
+        upstream: config.upstreamBaseUrl,
+      });
+      return;
+    }
+
+    if (req.method === "POST" && req.url?.startsWith("/dry-run")) {
+      await handleDryRun(req, res);
+      return;
+    }
+
+    if (req.method === "POST" && (req.url?.startsWith("/v1/responses") || req.url?.startsWith("/responses"))) {
+      await handleResponses(req, res);
+      return;
+    }
+
+    responseJson(res, 404, { error: { message: `Unsupported route: ${req.method} ${req.url}` } });
+  } catch (error) {
+    logServer("unhandled request error", { error: error.stack || error.message });
+    if (!res.headersSent) responseJson(res, 500, { error: { message: error.message } });
+  }
+});
+
+server.on("clientError", (error, socket) => {
+  logServer("client error", { error: error.message });
+  if (socket.writable) {
+    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+  }
+});
+
+server.listen(config.port || 8787, config.host || "127.0.0.1", () => {
+  logServer("router gateway started", {
+    port: config.port || 8787,
+    router_model: config.routerModel,
+    router_effort: config.routerEffort || "low",
+    upstream: config.upstreamBaseUrl,
+  });
+  console.log(`PETO router gateway listening on http://${config.host || "127.0.0.1"}:${config.port || 8787}`);
+});
+

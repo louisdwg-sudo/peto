@@ -26,7 +26,7 @@ The dispatcher must not answer the user, rewrite the request, change intent, or 
 ## Core Components
 
 - `packages/core/` - routing schemas, evaluation logic, and memory interfaces.
-- `packages/gateway/` - OpenAI-compatible proxy for clients that can point at a custom `base_url`.
+- `packages/gateway/` - OpenAI-compatible proxy for clients that can point at a custom `base_url`; includes the reference dispatcher gateway.
 - `packages/mcp/` - MCP adapter for agents that cannot use a proxy.
 - `packages/cli/` - command-line utilities for route tests, evals, and diagnostics.
 - `skills/` - optional Codex skills for analysis, evaluation, and local model benchmarking.
