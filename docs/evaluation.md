@@ -20,22 +20,33 @@ Every route should log:
 
 ```json
 {
+  "schema_version": "1.0",
   "phase": "request",
+  "id": "string",
+  "route_id": "string",
   "input_hash": "string",
   "incoming_model": "string",
   "incoming_effort": "string",
   "chosen_model": "string",
   "chosen_effort": "string",
+  "profile_segment": "string",
+  "risk_tier": "low|medium|high|unknown",
+  "language": "string",
+  "request_class": "string",
   "router_model": "string",
   "router_effort": "string",
   "router_confidence": 0.0,
   "router_rationale": "string",
+  "router_usage": {},
+  "executor_usage": null,
+  "acceptance_label": "accepted|underfit|overfit|rejected|ambiguous|invalid|null",
+  "annotations": [],
   "retrieved_notes": [],
   "feedback_signal": false
 }
 ```
 
-Response logs should include status, latency, and usage when available.
+Response logs should include `status`, `latency_ms`, and `executor_usage` when available. During migration, response logs may also keep `usage` as a backward-compatible alias for `executor_usage`. Router usage and executor usage must stay separate.
 
 ## Underfit Detection
 
@@ -68,3 +79,36 @@ All command questions are minimal.
 
 Use historical matched baselines when possible. If no baseline exists, say the baseline is pending rather than inventing precision.
 
+## CLI Evaluation
+
+Use the CLI for local, reproducible checks against router JSONL logs:
+
+```bash
+npm run cli -- doctor
+npm run cli -- feedback --route-id ROUTE_ID --label accepted
+npm run cli -- eval
+npm run cli -- replay --limit 10
+npm run cli -- verify create --ticket ticket.json
+npm run cli -- verify run --id peto-verify-run
+npm run cli -- verify gate --id peto-verify-run
+npm run cli -- verify report --id peto-verify-run
+```
+
+`peto eval` reads the configured router and feedback logs, then reports:
+
+- route JSON validity
+- effort distribution
+- acceptance, rejection, retry/escalation, overfit, and underfit rates
+- estimated xhigh savings when usage data exists
+- dispatcher overhead when router usage is logged
+- cost per accepted outcome when token usage and acceptance labels are available
+- median latency
+- weakest evidence and the next test needed
+
+The CLI should not claim exact savings without real counterfactual xhigh runs. When logs do not contain enough usage or feedback data, it must say `baseline pending` and name the missing evidence.
+
+`peto verify` writes deterministic offline verification artifacts under `memory/verification/runs/<run_id>/`. V1 verification runs the candidate router and fixed baselines over logged samples only; it does not execute user requests or invoke RouteLLM unless a later explicit comparator ticket adds that behavior.
+
+## Agent-Orchestrated Verification
+
+V1 automated verification should run through `peto verify` first. The Symphony loop spec in [symphony-verification-loop.md](symphony-verification-loop.md) remains a design reference for a later agent wrapper, not a dependency of the PETO core harness.

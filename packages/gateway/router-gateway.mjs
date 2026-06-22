@@ -367,6 +367,8 @@ function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSo
   const logPath = config.logPath || path.join(memoryPath, "dispatcher/logs/router-events.jsonl");
   appendJsonl(logPath, {
     id,
+    route_id: id,
+    schema_version: "1.0",
     phase: "request",
     route_source: routeSource,
     route_source_detail: routeSourceDetail ?? route.source ?? null,
@@ -382,6 +384,14 @@ function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSo
     router_confidence: route.confidence ?? null,
     router_rationale: route.rationale_short ?? null,
     router_usage: routeUsage,
+    executor_usage: null,
+    usage: routeUsage,
+    profile_segment: config.defaultProfileSegment || "default",
+    risk_tier: config.defaultRiskTier || "unknown",
+    language: config.defaultLanguage || "unknown",
+    request_class: config.defaultRequestClass || "unknown",
+    acceptance_label: null,
+    annotations: [],
     retrieved_notes: notes.map(note => note.file),
     feedback_signal: detectDispleasure(userText),
   });
@@ -399,11 +409,17 @@ function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSo
 function logRouteComplete({ id, status, statusCode, latencyMs, usage, error }) {
   appendJsonl(config.logPath || path.join(memoryPath, "dispatcher/logs/router-events.jsonl"), {
     id,
+    route_id: id,
+    schema_version: "1.0",
     phase: "response",
     status,
     status_code: statusCode ?? null,
     latency_ms: latencyMs,
+    router_usage: null,
+    executor_usage: usage ?? null,
     usage: usage ?? null,
+    acceptance_label: null,
+    annotations: [],
     error: error ? String(error).slice(0, 800) : null,
   });
 }

@@ -4,8 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Personalized Effort and Tokenomics Optimization research scaffold.",
+  "bin": {
+    "peto": "./packages/cli/peto-cli.mjs"
+  },
   "scripts": {
-    "check": "node --check packages/gateway/router-gateway.mjs && node --check packages/mcp/peto-mcp-server.mjs && python3 -m py_compile packages/dispatcher/local-qwen-dispatcher.py",
+    "check": "node --check packages/cli/peto-cli.mjs && for file in packages/core/*.mjs; do node --check \"$file\"; done && node --check packages/gateway/router-gateway.mjs && node --check packages/mcp/peto-mcp-server.mjs && python3 -m py_compile packages/dispatcher/local-qwen-dispatcher.py",
+    "test": "node --test tests/*.test.mjs",
+    "cli": "node packages/cli/peto-cli.mjs",
     "dispatcher:qwen": "python3 packages/dispatcher/local-qwen-dispatcher.py",
     "gateway": "node packages/gateway/router-gateway.mjs",
     "mcp": "node packages/mcp/peto-mcp-server.mjs"
