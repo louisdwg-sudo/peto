@@ -28,7 +28,7 @@ This objective is personalized by definition. Acceptance depends on the user, no
 
 Effort and token optimization becomes practical when it is personalized.
 
-Public benchmarks and generic routers optimize for average performance. PETO optimizes for the user's actual acceptance curve. It learns from real interactions:
+Public benchmarks and generic routers optimize for average performance. PETO optimizes for each user profile's actual acceptance curve. It learns from real interactions:
 
 - explicit rejection
 - retry requests
@@ -181,13 +181,13 @@ The gateway is the best adapter for clients that can point to an OpenAI-compatib
 
 The core PETO asset is not the dispatcher model. The core asset is the feedback memory.
 
-A cheap dispatcher with good memory can outperform a stronger generic dispatcher that does not know the user. A static routing taxonomy can only say "coding often needs high effort". PETO can learn that this user accepts minimal effort for shell commands, expects high effort for public-facing architecture, and dislikes underbuilt product thinking.
+A cheap dispatcher with good memory can outperform a stronger generic dispatcher that does not know the target user profile. A static routing taxonomy can only say "coding often needs high effort". PETO can learn that one profile accepts minimal effort for shell commands, another expects high effort for public-facing architecture, and another rejects underbuilt product thinking.
 
 That is the practical difference between ETO and PETO:
 
 ```text
 ETO: optimize effort and tokens for the task.
-PETO: optimize effort and tokens for this user's accepted outcome.
+PETO: optimize effort and tokens for the target user profile's accepted outcome.
 ```
 
 ## Conclusion
@@ -206,4 +206,3 @@ The first implementation should stay boring:
 If PETO works, it should reduce unnecessary high-effort calls without increasing user-visible failure. If it fails, the logs should make the failure obvious: underfit rose, retries increased, or savings were eaten by dispatcher overhead.
 
 That makes PETO useful as both a methodology and an engineering experiment. It does not need to be perfect on day one. It needs to learn from the user faster than a generic router can.
-

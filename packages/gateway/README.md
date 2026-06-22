@@ -58,6 +58,26 @@ http://127.0.0.1:8787
 
 This gateway is effort-only by default. It does not switch executor models, call a second-stage arbiter, or rewrite the user request.
 
+## Telemetry
+
+The gateway logs route events using PETO verification schema `1.0`.
+
+- request events include `route_id`, `profile_segment`, `risk_tier`, `language`, `request_class`, `router_usage`, `executor_usage: null`, `acceptance_label`, and `annotations`
+- response events include the same `route_id`, `executor_usage`, and a backward-compatible `usage` alias
+- router usage and executor usage stay separate so the CLI can compute dispatcher overhead and cost per accepted outcome
+
+Useful inspection commands:
+
+```bash
+npm run cli -- replay --limit 10
+npm run cli -- feedback --route-id ROUTE_ID --label accepted
+npm run cli -- eval
+npm run cli -- verify create --ticket ticket.json
+npm run cli -- verify run --id RUN_ID
+npm run cli -- verify gate --id RUN_ID
+npm run cli -- verify report --id RUN_ID
+```
+
 ## Dispatcher Backends
 
 Use `routerBackend: "local_http"` when a local dispatcher service is available. The gateway will call `localRouterUrl`, validate the returned effort, apply only `reasoning.effort`, and forward the original request to the upstream executor.

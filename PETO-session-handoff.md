@@ -6,15 +6,15 @@
 
 ## Core Idea
 
-PETO is a personalized dispatcher system that optimizes LLM reasoning effort and token spend based on Louis-specific satisfaction, retry history, output acceptance standards, and structured long-term memory.
+PETO is a personalized dispatcher system that optimizes LLM reasoning effort and token spend based on user-specific satisfaction, retry history, output acceptance standards, and structured long-term memory.
 
 The purpose is not generic model routing. The purpose is:
 
-> Optimize Louis' output satisfaction per token spent.
+> Optimize user-accepted output quality per token spent.
 
 ## Main Thesis
 
-Public benchmarks and generic model routers optimize for average users. PETO optimizes for one user's subjective acceptance threshold.
+Public benchmarks and generic model routers optimize for average users. PETO optimizes for each user's or tenant's observed acceptance threshold.
 
 A simple question may only need a cheap, low-effort response. A high-stakes or quality-sensitive task may need higher effort. The system should learn this from long-term feedback rather than fixed task categories.
 
@@ -43,7 +43,7 @@ Choose target model and reasoning effort.
 
 It must not:
 
-- Rewrite Louis' original request.
+- Rewrite the user's original request.
 - Summarize the user request for execution.
 - Add hidden requirements.
 - Answer the user.
@@ -79,14 +79,14 @@ Dispatcher RAG records every dispatch decision in logs.
 
 Only write durable feedback analysis into LLMWiki when:
 
-1. Louis explicitly expresses dissatisfaction with quality or effort.
+1. The user explicitly expresses dissatisfaction with quality or effort.
 2. Codex decides the same quality could have been achieved with lower effort.
 3. A retry/escalation materially changes the future best effort.
-4. Louis manually says to record it.
+4. The user or operator manually says to record it.
 
-If Codex recommends a lower future effort for a similar situation, that lower effort becomes the suggested future standard unless Louis later rejects that output quality.
+If Codex recommends a lower future effort for a similar situation, that lower effort becomes the suggested future standard unless the relevant user profile later rejects that output quality.
 
-If Louis rejects output with terms like "shit", "sucks", "trash", "rubbish", "not right", "you missed", "reject", or equivalent, mark the prior route as failed/questionable and update the lesson.
+If the user rejects output with terms like "shit", "sucks", "trash", "rubbish", "not right", "you missed", "reject", or equivalent, mark the prior route as failed/questionable and update the lesson.
 
 ## LLMWiki Structure
 
@@ -120,7 +120,7 @@ corporate-ai-automation/
 The three wikis should remain separate:
 
 - `dispatcher`: effort/model/token routing.
-- `louis-dev`: Louis' product/dev/UIUX/cost preferences.
+- `user-dev`: user, tenant, or operator product/dev/UIUX/cost preferences.
 - `corporate-ai-automation`: knowledge base for future corporate AI consulting business.
 
 ## Existing Local Vault Path
@@ -199,7 +199,7 @@ Instead:
 Use minimal safety/policy guardrails
 + cheap dispatcher
 + honest telemetry
-+ Louis-specific feedback
++ user-specific feedback
 + LLMWiki lessons
 + periodic review
 ```
@@ -230,4 +230,3 @@ wire_api = "responses"
 ```
 
 The gateway must be safe to fail open or fall back to default routing.
-
