@@ -39,6 +39,7 @@ test("normalizeRouteEvent preserves legacy usage and adds verification fields", 
   assert.equal(normalized.route_id, "route-1");
   assert.deepEqual(normalized.executor_usage, { total_tokens: 120 });
   assert.deepEqual(normalized.usage, { total_tokens: 120 });
+  assert.equal(normalized.retry_of, null);
   assert.deepEqual(normalized.annotations, []);
 });
 
@@ -126,6 +127,33 @@ test("evalLogs does not count feedback_signal routes as accepted and emits effor
   assert.ok(data.effort_breakdown.medium, "effort_breakdown should have a medium entry");
   assert.equal(data.effort_breakdown.medium.count, 2);
   assert.equal(typeof data.low_minimal_trend, "object");
+});
+
+test("evalLogs counts explicitly accepted routes even when the response failed", () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  writeJson(configPath, { memoryPath: root, logPath, feedbackPath, localRouterUrl: "http://127.0.0.1:9/route" });
+
+  appendJsonl(logPath, { id: "accepted-failed-route", phase: "request", chosen_effort: "medium" });
+  appendJsonl(logPath, {
+    id: "accepted-failed-route",
+    phase: "response",
+    status: "error",
+    executor_usage: { total_tokens: 100 },
+  });
+  appendJsonl(feedbackPath, {
+    id: "accepted-failed-route",
+    route_id: "accepted-failed-route",
+    acceptance_label: "accepted",
+    signal: "explicit_label",
+  });
+
+  const data = evalLogs({ config: configPath });
+
+  assert.equal(data.routes.failed, 1);
+  assert.equal(data.outcomes.accepted_estimate, 1);
 });
 
 test("writeFeedback records explicit labels for route ids", () => {
@@ -220,6 +248,23 @@ test("verification create accepts nested YAML gates and baselines", () => {
 
   assert.equal(parsedManifest.gates.min_route_json_validity, 0.95);
   assert.deepEqual(parsedManifest.ticket.baselines, [{ name: "fixed_medium", type: "fixed_effort", effort: "medium" }]);
+});
+
+test("verification create reports malformed YAML tickets with a clear parser message", () => {
+  const root = makeTempDir();
+  const ticketPath = path.join(root, "ticket.yaml");
+  const configPath = path.join(root, "peto.config.json");
+  writeJson(configPath, {
+    memoryPath: root,
+    logPath: path.join(root, "router-events.jsonl"),
+    feedbackPath: path.join(root, "feedback-signals.jsonl"),
+  });
+  fs.writeFileSync(ticketPath, ["- unsupported", ""].join("\n"));
+
+  assert.throws(
+    () => createVerificationRun({ config: configPath, ticket: ticketPath }),
+    /Failed to parse ticket YAML \(line ~1\): Unsupported YAML list at indent 0\. Supported subset: flat key\/value, nested maps, simple lists\./,
+  );
 });
 
 test("verification run produces deterministic samples, metrics, gates, verdict, and report", () => {

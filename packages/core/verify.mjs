@@ -183,7 +183,16 @@ export function reportVerificationRun(args = {}) {
 
 function readTicket(file) {
   const text = fs.readFileSync(path.resolve(file), "utf8");
-  if (/\.ya?ml$/i.test(file)) return parseSimpleYaml(text);
+  if (/\.ya?ml$/i.test(file)) {
+    try {
+      return parseSimpleYaml(text);
+    } catch (error) {
+      const line = Number.isFinite(error.yamlLine) ? error.yamlLine : 1;
+      throw new Error(
+        `Failed to parse ticket YAML (line ~${line}): ${error.message}. Supported subset: flat key/value, nested maps, simple lists.`,
+      );
+    }
+  }
   return JSON.parse(text);
 }
 
@@ -202,7 +211,7 @@ function parseSimpleYaml(text) {
     const parent = frame.value;
 
     if (trimmed.startsWith("- ")) {
-      if (!Array.isArray(parent)) throw new Error(`Unsupported YAML list at indent ${indent}`);
+      if (!Array.isArray(parent)) throw yamlParseError(`Unsupported YAML list at indent ${indent}`, index + 1);
       const itemText = trimmed.slice(2);
       const item = itemText.includes(":") ? parseYamlInlineMap(itemText) : parseYamlValue(itemText);
       parent.push(item);
@@ -222,6 +231,12 @@ function parseSimpleYaml(text) {
     stack.push({ indent, value, key: key.trim() });
   }
   return root;
+}
+
+function yamlParseError(message, line) {
+  const error = new Error(message);
+  error.yamlLine = line;
+  return error;
 }
 
 function parseYamlInlineMap(text) {

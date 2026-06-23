@@ -14,6 +14,7 @@ export function normalizeRouteEvent(event = {}) {
     route_id: routeId,
     ...event,
     route_id: routeId,
+    retry_of: event.retry_of || null,
     annotations,
   };
 
