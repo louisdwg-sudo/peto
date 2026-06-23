@@ -105,6 +105,29 @@ test("evalLogs splits router and executor usage and honors explicit feedback lab
   assert.equal(data.cost_per_accepted_outcome.tokens, 150);
 });
 
+test("evalLogs does not count feedback_signal routes as accepted and emits effort_breakdown and low_minimal_trend", () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  writeJson(configPath, { memoryPath: root, logPath, feedbackPath, localRouterUrl: "http://127.0.0.1:9/route" });
+
+  // Route with gateway displeasure signal and no feedback row — was incorrectly counted as accepted before fix
+  appendJsonl(logPath, { id: "displeased-route", phase: "request", chosen_effort: "medium", feedback_signal: true });
+  appendJsonl(logPath, { id: "displeased-route", phase: "response", status: "ok", executor_usage: { total_tokens: 100 } });
+  // Clean unlabeled route — should still count as accepted
+  appendJsonl(logPath, { id: "clean-route", phase: "request", chosen_effort: "medium", feedback_signal: false });
+  appendJsonl(logPath, { id: "clean-route", phase: "response", status: "ok", executor_usage: { total_tokens: 80 } });
+
+  const data = evalLogs({ config: configPath });
+
+  assert.equal(data.outcomes.accepted_estimate, 1, "feedback_signal route must not be counted as accepted");
+  assert.equal(typeof data.effort_breakdown, "object");
+  assert.ok(data.effort_breakdown.medium, "effort_breakdown should have a medium entry");
+  assert.equal(data.effort_breakdown.medium.count, 2);
+  assert.equal(typeof data.low_minimal_trend, "object");
+});
+
 test("writeFeedback records explicit labels for route ids", () => {
   const root = makeTempDir();
   const feedbackPath = path.join(root, "feedback-signals.jsonl");

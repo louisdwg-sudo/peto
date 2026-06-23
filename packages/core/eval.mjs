@@ -103,6 +103,11 @@ export function evaluateRows({ routerRows, invalidRows = 0, feedbackRows = [], c
   const failedRoutes = routes.filter(pair => isFailedResponse(pair.response)).length;
   const validRouteCount = routes.filter(pair => config.allowedEfforts.includes(pair.request.chosen_effort)).length;
   const labels = feedbackLabelMap(feedbackRows);
+  // Merge gateway displeasure signals into labels so feedback_signal routes aren't silently counted as accepted
+  for (const row of routerRows) {
+    const id = row.route_id || row.id;
+    if (row.feedback_signal && id && !labels.has(id)) labels.set(id, "rejected");
+  }
   const responseUsage = routes.map(pair => pair.response?.executor_usage ?? pair.response?.usage).filter(Boolean);
   const routerUsage = routes.map(pair => pair.request.router_usage).filter(Boolean);
   const executorTokens = sumUsageTokens(responseUsage);
@@ -113,8 +118,7 @@ export function evaluateRows({ routerRows, invalidRows = 0, feedbackRows = [], c
   const labeledUnderfit = countFeedback(feedbackRows, ["underfit"]);
   const labeledOverfit = countFeedback(feedbackRows, ["overfit"]);
   const retryEscalation = countFeedback(feedbackRows, ["retry", "escalation"]);
-  const explicitAccepted = Array.from(labels.values()).filter(label => label === "accepted").length;
-  const accepted = explicitAccepted || feedbackRows.length
+  const accepted = labels.size > 0
     ? countAcceptedFromLabels(routes, labels, failedRoutes)
     : Math.max(0, totalRoutes - explicitDispleasure - labeledUnderfit - failedRoutes);
   const baselineTokens = totalRoutes && totalTokens ? estimateXhighBaseline(routes, totalTokens) : null;
@@ -188,6 +192,8 @@ export function evaluateRows({ routerRows, invalidRows = 0, feedbackRows = [], c
     next_test: totalRoutes
       ? "Run matched xhigh counterfactuals for representative accepted routes."
       : "Run `peto route` or the gateway, then collect reviewer outcomes.",
+    effort_breakdown: effortBreakdown(routes, labels),
+    low_minimal_trend: lowMinimalTrend(routes),
   };
 }
 
@@ -204,4 +210,31 @@ function countAcceptedFromLabels(routes, labels, failedRoutes) {
     if (!label && !isFailedResponse(pair.response)) accepted += 1;
   }
   return Math.max(0, accepted - failedRoutes);
+}
+
+function effortBreakdown(routes, labels) {
+  const breakdown = {};
+  for (const effort of EFFORTS) {
+    const slice = routes.filter(r => r.request.chosen_effort === effort);
+    if (!slice.length) continue;
+    const underfitCount = slice.filter(r => labels.get(r.request.route_id) === "underfit").length;
+    const rejectedCount = slice.filter(r => ["rejected", "ambiguous"].includes(labels.get(r.request.route_id))).length;
+    breakdown[effort] = {
+      count: slice.length,
+      underfit_rate: percent(underfitCount, slice.length),
+      rejection_rate: percent(rejectedCount, slice.length),
+    };
+  }
+  return breakdown;
+}
+
+function lowMinimalTrend(routes) {
+  const trend = {};
+  for (const window of [50, 100, 200]) {
+    const slice = routes.slice(-window);
+    if (!slice.length) continue;
+    const count = slice.filter(r => ["minimal", "low"].includes(r.request.chosen_effort)).length;
+    trend[`last_${window}`] = percent(count, slice.length);
+  }
+  return trend;
 }
