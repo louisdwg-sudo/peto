@@ -119,7 +119,7 @@ export function evaluateRows({ routerRows, invalidRows = 0, feedbackRows = [], c
   const labeledOverfit = countFeedback(feedbackRows, ["overfit"]);
   const retryEscalation = countFeedback(feedbackRows, ["retry", "escalation"]);
   const accepted = labels.size > 0
-    ? countAcceptedFromLabels(routes, labels, failedRoutes)
+    ? countAcceptedFromLabels(routes, labels)
     : Math.max(0, totalRoutes - explicitDispleasure - labeledUnderfit - failedRoutes);
   const baselineTokens = totalRoutes && totalTokens ? estimateXhighBaseline(routes, totalTokens) : null;
   const saved = baselineTokens && totalTokens ? Math.max(0, baselineTokens - totalTokens) : null;
@@ -202,14 +202,14 @@ function addKnownTokens(a, b) {
   return (a || 0) + (b || 0);
 }
 
-function countAcceptedFromLabels(routes, labels, failedRoutes) {
+function countAcceptedFromLabels(routes, labels) {
   let accepted = 0;
   for (const pair of routes) {
     const label = labels.get(pair.request.route_id);
     if (label === "accepted") accepted += 1;
     if (!label && !isFailedResponse(pair.response)) accepted += 1;
   }
-  return Math.max(0, accepted - failedRoutes);
+  return accepted;
 }
 
 function effortBreakdown(routes, labels) {
