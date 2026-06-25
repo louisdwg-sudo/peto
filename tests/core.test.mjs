@@ -7,6 +7,7 @@ import test from "node:test";
 import { DEFAULT_CONFIG, loadConfig } from "../packages/core/config.mjs";
 import { evalLogs } from "../packages/core/eval.mjs";
 import { appendJsonl, readJsonl } from "../packages/core/jsonl.mjs";
+import { parseSseUsage } from "../packages/core/sse.mjs";
 import {
   createVerificationRun,
   gateVerificationRun,
@@ -335,8 +336,65 @@ test("verification run produces deterministic samples, metrics, gates, verdict, 
   assert.equal(run.metrics.cost_per_accepted_outcome.tokens > 0, true);
   assert.equal(gated.verdict.verdict, "hold");
   assert.equal(gated.gates.some(gate => gate.name === "min_net_savings_ratio" && gate.severity === "soft"), true);
+  const humanReviewGate = gated.gates.find(gate => gate.name === "human_review_queue_clear");
+  assert.equal(humanReviewGate.severity, "soft");
+  assert.equal(humanReviewGate.pass, true);
+  assert.match(humanReviewGate.note, /not configured/);
+  assert.equal(gated.verdict.human_review_required, false);
+  assert.equal(gated.verdict.human_review_queue_clear, true);
   assert.equal(reported.report_path.endsWith("report.md"), true);
   assert.match(fs.readFileSync(reported.report_path, "utf8"), /PETO Verification Report/);
+});
+
+test("verification gate soft-fails when configured human review queue is non-empty", () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const queuePath = path.join(root, "human-review-queue.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  writeJson(configPath, {
+    memoryPath: root,
+    logPath,
+    feedbackPath,
+    humanReviewQueuePath: queuePath,
+    allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+  });
+  writeJson(ticketPath, {
+    id: "peto-verify-human-review-queue",
+    seed: 13,
+    sample_size: 1,
+    gates: { min_net_savings_ratio: 0 },
+  });
+  fs.writeFileSync(queuePath, `${JSON.stringify({ route_id: "route-review", reason: "needs review" })}\n`);
+  appendJsonl(logPath, {
+    id: "route-review",
+    phase: "request",
+    chosen_effort: "medium",
+    router_usage: { total_tokens: 5 },
+    profile_segment: "default",
+    request_class: "coding",
+    language: "en",
+    risk_tier: "low",
+  });
+  appendJsonl(logPath, {
+    id: "route-review",
+    phase: "response",
+    status: "ok",
+    executor_usage: { total_tokens: 80 },
+    latency_ms: 100,
+  });
+
+  const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+  runVerification({ config: configPath, id: created.run_id });
+  const gated = gateVerificationRun({ config: configPath, id: created.run_id });
+  const humanReviewGate = gated.gates.find(gate => gate.name === "human_review_queue_clear");
+
+  assert.equal(humanReviewGate.severity, "soft");
+  assert.equal(humanReviewGate.pass, false);
+  assert.equal(gated.verdict.human_review_required, true);
+  assert.equal(gated.verdict.human_review_queue_clear, false);
+  assert.equal(gated.verdict.verdict, "hold");
 });
 
 test("new-format verification logs block when required stratification fields are missing", () => {
@@ -384,4 +442,21 @@ test("new-format verification logs block when required stratification fields are
   assert.deepEqual(run.missing_verification_fields, [{ route_id: "route-missing", field: "request_class" }]);
   assert.equal(gated.verdict.verdict, "blocked");
   assert.equal(gated.verdict.blocking_reason, "required verification telemetry fields are missing");
+});
+
+test("parseSseUsage returns usage from final data event and null for malformed streams", () => {
+  const usage = { input_tokens: 10, output_tokens: 4, total_tokens: 14 };
+  const stream = [
+    "event: response.output_text.delta",
+    'data: {"delta":"hello"}',
+    "",
+    "event: response.completed",
+    `data: ${JSON.stringify({ response: { usage } })}`,
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+
+  assert.deepEqual(parseSseUsage(stream), usage);
+  assert.equal(parseSseUsage("data: {not-json}\n\nnot-sse"), null);
 });
