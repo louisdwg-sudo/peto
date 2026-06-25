@@ -4,6 +4,7 @@ import path from "node:path";
 import { EFFORTS, loadConfig } from "./config.mjs";
 import { evaluateRows, feedbackLabelMap, groupRoutes, sumUsageTokens } from "./eval.mjs";
 import { hashText, sha256Text, stableJson } from "./hash.mjs";
+import { judgeRoute } from "./judge.mjs";
 import { readJson, readJsonl, writeJson } from "./jsonl.mjs";
 import { validateVerificationFields } from "./telemetry.mjs";
 
@@ -150,6 +151,8 @@ export async function executeVerificationRun(args = {}) {
   for (const item of plan) rows.push(await executePlanItem({ item, config }));
   const resultsPath = path.join(runDir, "execution-results.jsonl");
   writeJsonlRows(resultsPath, rows);
+  const qualityLabelsPath =
+    config.enableQualityJudge === false ? null : await writeQualityLabels({ runDir, rows, plan, config });
 
   const metricsPath = path.join(runDir, "metrics.json");
   const metrics = readJson(metricsPath);
@@ -157,7 +160,11 @@ export async function executeVerificationRun(args = {}) {
   writeJson(manifestPath, {
     ...manifest,
     status: "executed",
-    annotations: unique([...(manifest.annotations || []), "counterfactual_executed"]),
+    annotations: unique([
+      ...(manifest.annotations || []),
+      "counterfactual_executed",
+      qualityLabelsPath ? "quality_judge_complete" : null,
+    ]),
   });
 
   return {
@@ -166,6 +173,7 @@ export async function executeVerificationRun(args = {}) {
     executed: rows.length,
     errors: rows.filter(row => row.error).length,
     results_path: resultsPath,
+    quality_labels_path: qualityLabelsPath,
   };
 }
 
@@ -429,15 +437,17 @@ async function executePlanItem({ item, config }) {
   }
 
   try {
-    const executor_usage = await callUpstreamExecutor({ item, config });
+    const result = await callUpstreamExecutor({ item, config });
     return executionRow(item, {
-      executor_usage,
+      executor_usage: result.executor_usage,
+      response_text: item.source === "candidate" ? result.response_text : null,
       latency_ms: Date.now() - started,
       error: null,
     });
   } catch (error) {
     return executionRow(item, {
       executor_usage: null,
+      response_text: null,
       latency_ms: Date.now() - started,
       error: error.message,
     });
@@ -450,6 +460,7 @@ function executionRow(item, fields) {
     effort: item.effort,
     source: item.source,
     executor_usage: fields.executor_usage,
+    response_text: fields.response_text ?? null,
     latency_ms: fields.latency_ms,
     error: fields.error,
   };
@@ -477,7 +488,10 @@ async function callUpstreamExecutor({ item, config }) {
         continue;
       }
       if (!response.ok) throw new Error(`Upstream ${response.status}: ${raw.slice(0, 500)}`);
-      return extractUsage(raw);
+      return {
+        executor_usage: extractUsage(raw),
+        response_text: extractResponseText(raw),
+      };
     } catch (error) {
       lastError = error;
       if (!/fetch failed|network|ECONN|ENOTFOUND|ETIMEDOUT/i.test(error.message)) throw error;
@@ -510,6 +524,47 @@ function extractUsage(raw) {
   } catch {
     throw new Error("Upstream returned non-JSON response.");
   }
+}
+
+function extractResponseText(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.output_text === "string") return parsed.output_text;
+    const outputText = parsed.output
+      ?.flatMap(item => item.content || [])
+      .map(content => content.text)
+      .filter(Boolean)
+      .join("\n");
+    return outputText || null;
+  } catch {
+    throw new Error("Upstream returned non-JSON response.");
+  }
+}
+
+async function writeQualityLabels({ runDir, rows, plan, config }) {
+  const labelsPath = path.join(runDir, "quality-labels.jsonl");
+  const candidatePlanByRouteId = new Map(plan.filter(item => item.source === "candidate").map(item => [item.route_id, item]));
+  const candidateRows = rows.filter(row => row.source === "candidate" && row.response_text && !row.error);
+  const labelRows = [];
+  for (const row of candidateRows) {
+    const planItem = candidatePlanByRouteId.get(row.route_id);
+    const result = await judgeRoute({
+      userExcerpt: planItem?.user_excerpt || null,
+      responseText: row.response_text,
+      chosenEffort: row.effort,
+      config,
+    });
+    labelRows.push({
+      route_id: row.route_id,
+      acceptance_label: result.label,
+      signal: "quality_judge",
+      reason: result.reason,
+      judge_model: config.judgeModel || "claude-haiku-4-5-20251001",
+      judge_usage: result.usage,
+    });
+  }
+  writeJsonlRows(labelsPath, labelRows);
+  return labelsPath;
 }
 
 function sleep(ms) {

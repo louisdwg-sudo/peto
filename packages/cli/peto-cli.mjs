@@ -20,6 +20,7 @@ Usage:
   peto route "user request" [--config FILE] [--json] [--no-log]
   peto feedback --route-id ID --label accepted|underfit|overfit|rejected|ambiguous|invalid [--notes TEXT]
   peto eval [--config FILE] [--log FILE] [--feedback FILE] [--json]
+    # quality-labels.jsonl from verify execute can be passed directly as --feedback
   peto replay [--config FILE] [--log FILE] [--limit N] [--json]
   peto verify create --ticket FILE [--config FILE] [--json]
   peto verify run --id RUN_ID [--config FILE] [--json]
@@ -139,6 +140,7 @@ function formatHuman(data) {
       `executed rows: ${data.executed}`,
       `errors: ${data.errors}`,
       data.results_path,
+      data.quality_labels_path || "quality labels: skipped",
     ].join("\n");
   }
   if (data.kind === "verify_gate") return `verify verdict: ${data.verdict.verdict}`;

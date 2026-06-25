@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { DEFAULT_CONFIG, loadConfig } from "../packages/core/config.mjs";
 import { evalLogs } from "../packages/core/eval.mjs";
+import { judgeRoute } from "../packages/core/judge.mjs";
 import { appendJsonl, readJsonl } from "../packages/core/jsonl.mjs";
 import { parseSseUsage } from "../packages/core/sse.mjs";
 import {
@@ -719,4 +720,197 @@ test("verification gate does not use estimated savings after failed execution", 
   assert.equal(savingsGate.observed, null);
   assert.match(savingsGate.reason, /exact execution savings unavailable/);
   assert.equal(gated.verdict.verdict, "hold");
+});
+
+test("judgeRoute returns ambiguous on unparseable judge output", async () => {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ output_text: "not-json", usage: { total_tokens: 4 } }));
+  });
+  const port = await listen(server);
+  try {
+    const result = await judgeRoute({
+      userExcerpt: "Summarize this.",
+      responseText: "Summary.",
+      chosenEffort: "low",
+      config: {
+        upstreamBaseUrl: `http://127.0.0.1:${port}`,
+        judgeModel: "mock-judge",
+      },
+    });
+
+    assert.equal(result.label, "ambiguous");
+    assert.equal(result.reason, null);
+    assert.equal(result.usage, null);
+    assert.match(result.error, /unparseable/i);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("verification execute writes quality labels for candidate responses only", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", chunk => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      const parsed = JSON.parse(body);
+      requests.push(parsed);
+      res.writeHead(200, { "content-type": "application/json" });
+      if (parsed.model === "mock-judge") {
+        if (parsed.input.includes("route-quality-b")) {
+          res.end(JSON.stringify({ output_text: "not-json", usage: { total_tokens: 3 } }));
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            output_text: JSON.stringify({ label: "accepted", reason: "The answer satisfied the request." }),
+            usage: { total_tokens: 7 },
+          }),
+        );
+        return;
+      }
+      const effort = parsed.reasoning?.effort;
+      res.end(
+        JSON.stringify({
+          output_text: `executor response for ${parsed.input}`,
+          usage: effort === "xhigh" ? { total_tokens: 100 } : { total_tokens: 40 },
+        }),
+      );
+    });
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      defaultTargetModel: "mock-executor",
+      judgeModel: "mock-judge",
+      judgeEffort: "low",
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-quality-labels",
+      seed: 6,
+      sample_size: 2,
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    for (const id of ["route-quality-a", "route-quality-b"]) {
+      appendJsonl(logPath, {
+        id,
+        phase: "request",
+        chosen_effort: "medium",
+        profile_segment: "default",
+        request_class: "coding",
+        language: "en",
+        risk_tier: "low",
+        user_excerpt: `Explain ${id}.`,
+      });
+      appendJsonl(logPath, { id, phase: "response", status: "ok", executor_usage: { total_tokens: 40 } });
+    }
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+    const result = await executeVerificationRun({ config: configPath, id: created.run_id });
+    const executionRows = readJsonl(path.join(created.run_dir, "execution-results.jsonl")).rows;
+    const labelRows = readJsonl(path.join(created.run_dir, "quality-labels.jsonl")).rows;
+    const evaluated = evalLogs({ config: configPath, feedback: result.quality_labels_path });
+    const manifest = JSON.parse(fs.readFileSync(path.join(created.run_dir, "run-manifest.json"), "utf8"));
+
+    assert.equal(result.quality_labels_path, path.join(created.run_dir, "quality-labels.jsonl"));
+    assert.equal(requests.filter(request => request.model === "mock-judge").length, 2);
+    assert.equal(executionRows.filter(row => row.source === "candidate" && row.response_text).length, 2);
+    assert.equal(executionRows.filter(row => row.source.startsWith("baseline_") && row.response_text === null).length, 2);
+    assert.deepEqual(
+      labelRows.map(row => row.acceptance_label).sort(),
+      ["accepted", "ambiguous"],
+    );
+    for (const row of labelRows) {
+      assert.deepEqual(Object.keys(row).sort(), [
+        "acceptance_label",
+        "judge_model",
+        "judge_usage",
+        "reason",
+        "route_id",
+        "signal",
+      ]);
+      assert.equal(row.signal, "quality_judge");
+      assert.equal(row.judge_model, "mock-judge");
+    }
+    assert.equal(evaluated.outcomes.accepted_estimate, 1);
+    assert.ok(manifest.annotations.includes("quality_judge_complete"));
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("verification execute skips quality judge when disabled", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  let judgeCalls = 0;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", chunk => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      const parsed = JSON.parse(body);
+      if (parsed.model === "mock-judge") judgeCalls += 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ output_text: "executor response", usage: { total_tokens: 10 } }));
+    });
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      defaultTargetModel: "mock-executor",
+      judgeModel: "mock-judge",
+      enableQualityJudge: false,
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-quality-disabled",
+      seed: 7,
+      sample_size: 1,
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    appendJsonl(logPath, {
+      id: "route-quality-disabled",
+      phase: "request",
+      chosen_effort: "medium",
+      profile_segment: "default",
+      request_class: "coding",
+      language: "en",
+      risk_tier: "low",
+      user_excerpt: "Explain disabled judge.",
+    });
+    appendJsonl(logPath, { id: "route-quality-disabled", phase: "response", status: "ok" });
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+    const result = await executeVerificationRun({ config: configPath, id: created.run_id });
+
+    assert.equal(result.quality_labels_path, null);
+    assert.equal(judgeCalls, 0);
+    assert.equal(fs.existsSync(path.join(created.run_dir, "quality-labels.jsonl")), false);
+  } finally {
+    await closeServer(server);
+  }
 });
