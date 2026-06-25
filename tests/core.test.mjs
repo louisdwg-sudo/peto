@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,6 +11,7 @@ import { appendJsonl, readJsonl } from "../packages/core/jsonl.mjs";
 import { parseSseUsage } from "../packages/core/sse.mjs";
 import {
   createVerificationRun,
+  executeVerificationRun,
   gateVerificationRun,
   reportVerificationRun,
   runVerification,
@@ -24,6 +26,14 @@ function makeTempDir() {
 function writeJson(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function listen(server) {
+  return new Promise(resolve => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
+}
+
+function closeServer(server) {
+  return new Promise(resolve => server.close(resolve));
 }
 
 test("normalizeRouteEvent preserves legacy usage and adds verification fields", () => {
@@ -459,4 +469,203 @@ test("parseSseUsage returns usage from final data event and null for malformed s
 
   assert.deepEqual(parseSseUsage(stream), usage);
   assert.equal(parseSseUsage("data: {not-json}\n\nnot-sse"), null);
+});
+
+test("verification execute dry-run prints plan without calling upstream", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  let calls = 0;
+  const server = http.createServer((req, res) => {
+    calls += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ usage: { total_tokens: 99 } }));
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      defaultTargetModel: "mock-executor",
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-execute-dry-run",
+      seed: 2,
+      sample_size: 1,
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    appendJsonl(logPath, {
+      id: "route-execute-dry-run",
+      phase: "request",
+      chosen_effort: "medium",
+      profile_segment: "default",
+      request_class: "coding",
+      language: "en",
+      risk_tier: "low",
+      user_excerpt: "Explain dry run.",
+    });
+    appendJsonl(logPath, { id: "route-execute-dry-run", phase: "response", status: "ok" });
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+    const result = await executeVerificationRun({ config: configPath, id: created.run_id, "dry-run": true });
+
+    assert.equal(result.kind, "verify_execute");
+    assert.equal(result.dry_run, true);
+    assert.equal(result.plan.length, 2);
+    assert.equal(calls, 0);
+    assert.equal(fs.existsSync(path.join(created.run_dir, "execution-results.jsonl")), false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("verification execute writes execution results and updates metrics with real token comparison", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", chunk => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      const parsed = JSON.parse(body);
+      requests.push(parsed);
+      const effort = parsed.reasoning?.effort;
+      const usage = effort === "xhigh"
+        ? { input_tokens: 10, output_tokens: 90, total_tokens: 100 }
+        : { input_tokens: 10, output_tokens: 30, total_tokens: 40 };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ usage }));
+    });
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      defaultTargetModel: "mock-executor",
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-execute",
+      seed: 3,
+      sample_size: 2,
+      gates: { min_net_savings_ratio: 0.5 },
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    for (const id of ["route-execute-a", "route-execute-b"]) {
+      appendJsonl(logPath, {
+        id,
+        phase: "request",
+        chosen_effort: "medium",
+        profile_segment: "default",
+        request_class: "coding",
+        language: "en",
+        risk_tier: "low",
+        user_excerpt: `Explain ${id}.`,
+      });
+      appendJsonl(logPath, { id, phase: "response", status: "ok", executor_usage: { total_tokens: 40 } });
+    }
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+    const result = await executeVerificationRun({ config: configPath, id: created.run_id });
+    const rows = readJsonl(path.join(created.run_dir, "execution-results.jsonl")).rows;
+    const metrics = JSON.parse(fs.readFileSync(path.join(created.run_dir, "metrics.json"), "utf8"));
+    const gated = gateVerificationRun({ config: configPath, id: created.run_id });
+
+    assert.equal(result.dry_run, false);
+    assert.equal(result.executed, 4);
+    assert.equal(requests.length, 4);
+    assert.equal(rows.length, 4);
+    assert.deepEqual(
+      rows.map(row => row.source).sort(),
+      ["baseline_fixed_xhigh", "baseline_fixed_xhigh", "candidate", "candidate"],
+    );
+    assert.ok(rows.every(row => row.route_id && row.effort && row.executor_usage && Number.isFinite(row.latency_ms)));
+    assert.equal(metrics.verification.exact_savings_available, true);
+    assert.equal(metrics.execution.actual_candidate_tokens, 80);
+    assert.equal(metrics.execution.actual_baseline_tokens, 200);
+    assert.equal(metrics.savings.exact, true);
+    assert.equal(metrics.savings.actual_tokens, 80);
+    assert.equal(metrics.savings.estimated_xhigh_baseline_tokens, 200);
+    assert.equal(metrics.savings.estimated_tokens_saved, 120);
+    assert.equal(gated.verdict.verdict, "promote");
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("verification execute enforces 50 sample limit and records upstream errors", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  let calls = 0;
+  const server = http.createServer((req, res) => {
+    calls += 1;
+    if (calls === 1) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "temporary" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ usage: { total_tokens: 10 } }));
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      defaultTargetModel: "mock-executor",
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-execute-limit",
+      seed: 4,
+      sample_size: 60,
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    for (let index = 0; index < 60; index += 1) {
+      const id = `route-limit-${index}`;
+      appendJsonl(logPath, {
+        id,
+        phase: "request",
+        chosen_effort: "medium",
+        profile_segment: "default",
+        request_class: "coding",
+        language: "en",
+        risk_tier: "low",
+        user_excerpt: `Explain ${id}.`,
+      });
+      appendJsonl(logPath, { id, phase: "response", status: "ok" });
+    }
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+    const result = await executeVerificationRun({ config: configPath, id: created.run_id });
+    const rows = readJsonl(path.join(created.run_dir, "execution-results.jsonl")).rows;
+
+    assert.equal(result.samples_considered, 50);
+    assert.equal(rows.length, 100);
+    assert.equal(rows.filter(row => row.error).length, 1);
+    assert.equal(rows.filter(row => row.executor_usage).length, 99);
+  } finally {
+    await closeServer(server);
+  }
 });
