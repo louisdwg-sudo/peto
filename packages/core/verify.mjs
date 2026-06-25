@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { EFFORTS, loadConfig } from "./config.mjs";
-import { evaluateRows, feedbackLabelMap, groupRoutes } from "./eval.mjs";
+import { evaluateRows, feedbackLabelMap, groupRoutes, sumUsageTokens } from "./eval.mjs";
 import { hashText, sha256Text, stableJson } from "./hash.mjs";
 import { readJson, readJsonl, writeJson } from "./jsonl.mjs";
 import { validateVerificationFields } from "./telemetry.mjs";
@@ -13,6 +13,9 @@ const DEFAULT_GATES = {
   max_dispatcher_overhead_ratio: 0.08,
   min_net_savings_ratio: 0.1,
 };
+
+const EXECUTION_SAMPLE_LIMIT = 50;
+const RATE_LIMIT_ATTEMPTS = 3;
 
 export function createVerificationRun(args = {}) {
   const config = loadConfig(args);
@@ -116,6 +119,53 @@ export function runVerification(args = {}) {
     samples: { count: sampleRows.length, sha256: samplesSha },
     metrics,
     missing_verification_fields: missing,
+  };
+}
+
+export async function executeVerificationRun(args = {}) {
+  const config = loadConfig(args);
+  const runDir = resolveRunDir(config, args.id);
+  const manifestPath = path.join(runDir, "run-manifest.json");
+  const manifest = readJson(manifestPath);
+  if (!manifest.run_id) throw new Error(`Missing run manifest for ${args.id}.`);
+
+  const samples = readJsonl(path.join(runDir, "samples.jsonl")).rows.slice(0, EXECUTION_SAMPLE_LIMIT);
+  const candidateRows = readJsonl(path.join(runDir, "candidate-routes.jsonl")).rows;
+  const baselineSets = readBaselineRouteFiles(runDir);
+  const routerRows = readJsonl(config.logPath).rows;
+  const plan = buildExecutionPlan({ samples, candidateRows, baselineSets, routerRows });
+  const dryRun = Boolean(args["dry-run"] || args.dryRun);
+  const base = {
+    kind: "verify_execute",
+    run_id: manifest.run_id,
+    run_dir: runDir,
+    dry_run: dryRun,
+    samples_considered: samples.length,
+    planned: plan.length,
+  };
+
+  if (dryRun) return { ...base, plan };
+
+  const rows = [];
+  for (const item of plan) rows.push(await executePlanItem({ item, config }));
+  const resultsPath = path.join(runDir, "execution-results.jsonl");
+  writeJsonlRows(resultsPath, rows);
+
+  const metricsPath = path.join(runDir, "metrics.json");
+  const metrics = readJson(metricsPath);
+  writeJson(metricsPath, updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConsidered: samples.length }));
+  writeJson(manifestPath, {
+    ...manifest,
+    status: "executed",
+    annotations: unique([...(manifest.annotations || []), "counterfactual_executed"]),
+  });
+
+  return {
+    ...base,
+    dry_run: false,
+    executed: rows.length,
+    errors: rows.filter(row => row.error).length,
+    results_path: resultsPath,
   };
 }
 
@@ -314,6 +364,202 @@ function baselinesForTicket(ticket = {}) {
 function writeJsonlRows(file, rows) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""));
+}
+
+function readBaselineRouteFiles(runDir) {
+  return fs
+    .readdirSync(runDir)
+    .filter(file => /^baseline-routes\..+\.jsonl$/.test(file))
+    .sort()
+    .map(file => ({
+      name: file.match(/^baseline-routes\.(.+)\.jsonl$/)[1],
+      rows: readJsonl(path.join(runDir, file)).rows,
+    }));
+}
+
+function buildExecutionPlan({ samples, candidateRows, baselineSets, routerRows }) {
+  const candidateById = routeRowsById(candidateRows);
+  const routerTextByHash = new Map(routerRows.filter(row => row.input_hash).map(row => [row.input_hash, row.user_excerpt]));
+  const routerTextById = new Map(routerRows.map(row => [row.route_id || row.id, row.user_excerpt]).filter(([, text]) => text));
+  const baselines = baselineSets.map(set => ({ ...set, byId: routeRowsById(set.rows) }));
+  const plan = [];
+
+  for (const sample of samples) {
+    const routeId = sample.route_id;
+    const requestText = sample.user_excerpt || routerTextByHash.get(sample.input_hash) || routerTextById.get(routeId) || null;
+    const candidate = candidateById.get(routeId);
+    plan.push({
+      route_id: routeId,
+      effort: normalizeEffort(candidate?.target_effort || sample.chosen_effort),
+      source: "candidate",
+      user_excerpt: requestText,
+      input_hash: sample.input_hash || null,
+    });
+
+    for (const baseline of baselines) {
+      const route = baseline.byId.get(routeId);
+      plan.push({
+        route_id: routeId,
+        effort: normalizeEffort(route?.target_effort || baseline.name.replace(/^fixed_/, "")),
+        source: `baseline_${baseline.name}`,
+        user_excerpt: requestText,
+        input_hash: sample.input_hash || null,
+      });
+    }
+  }
+  return plan;
+}
+
+function routeRowsById(rows) {
+  return new Map(rows.map(row => [row.route_id, row]).filter(([routeId]) => routeId));
+}
+
+function normalizeEffort(effort) {
+  return EFFORTS.includes(effort) ? effort : "medium";
+}
+
+async function executePlanItem({ item, config }) {
+  const started = Date.now();
+  if (!item.user_excerpt) {
+    return executionRow(item, {
+      executor_usage: null,
+      latency_ms: null,
+      error: "missing user_excerpt",
+    });
+  }
+
+  try {
+    const executor_usage = await callUpstreamExecutor({ item, config });
+    return executionRow(item, {
+      executor_usage,
+      latency_ms: Date.now() - started,
+      error: null,
+    });
+  } catch (error) {
+    return executionRow(item, {
+      executor_usage: null,
+      latency_ms: Date.now() - started,
+      error: error.message,
+    });
+  }
+}
+
+function executionRow(item, fields) {
+  return {
+    route_id: item.route_id,
+    effort: item.effort,
+    source: item.source,
+    executor_usage: fields.executor_usage,
+    latency_ms: fields.latency_ms,
+    error: fields.error,
+  };
+}
+
+async function callUpstreamExecutor({ item, config }) {
+  if (!config.upstreamBaseUrl) throw new Error("verify execute requires upstreamBaseUrl in config.");
+  if (!config.defaultTargetModel) throw new Error("verify execute requires defaultTargetModel in config.");
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= RATE_LIMIT_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(upstreamResponsesUrl(config), {
+        method: "POST",
+        headers: upstreamHeaders(config),
+        body: JSON.stringify({
+          model: config.defaultTargetModel,
+          input: item.user_excerpt,
+          reasoning: { effort: item.effort },
+        }),
+      });
+      const raw = await response.text();
+      if (response.status === 429 && attempt < RATE_LIMIT_ATTEMPTS) {
+        await sleep((config.verifyExecuteRetryBaseMs || 250) * 2 ** (attempt - 1));
+        continue;
+      }
+      if (!response.ok) throw new Error(`Upstream ${response.status}: ${raw.slice(0, 500)}`);
+      return extractUsage(raw);
+    } catch (error) {
+      lastError = error;
+      if (!/fetch failed|network|ECONN|ENOTFOUND|ETIMEDOUT/i.test(error.message)) throw error;
+      break;
+    }
+  }
+  throw lastError;
+}
+
+function upstreamResponsesUrl(config) {
+  return new URL("/v1/responses", config.upstreamBaseUrl);
+}
+
+function upstreamHeaders(config) {
+  const headers = {
+    "content-type": "application/json",
+    accept: "application/json",
+    ...(config.upstreamHeaders || {}),
+  };
+  const hasAuthorization = Object.keys(headers).some(key => key.toLowerCase() === "authorization");
+  const token = config.upstreamApiKey || config.apiKey || config.openaiApiKey || process.env.OPENAI_API_KEY;
+  if (token && !hasAuthorization) headers.authorization = `Bearer ${token}`;
+  return headers;
+}
+
+function extractUsage(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed.usage || parsed.response?.usage || null;
+  } catch {
+    throw new Error("Upstream returned non-JSON response.");
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConsidered }) {
+  const candidateRows = rows.filter(row => row.source === "candidate" && !row.error);
+  const baselineRows = rows.filter(row => row.source.startsWith("baseline_") && !row.error);
+  const actualCandidateTokens = sumUsageTokens(candidateRows.map(row => row.executor_usage));
+  const actualBaselineTokens = sumUsageTokens(baselineRows.map(row => row.executor_usage));
+  const exact = actualCandidateTokens !== null && actualBaselineTokens !== null;
+  const saved = exact ? Math.max(0, actualBaselineTokens - actualCandidateTokens) : null;
+  const baselineSources = [...new Set(baselineRows.map(row => row.source))].sort();
+  const updated = {
+    ...metrics,
+    verification: {
+      ...(metrics.verification || {}),
+      exact_savings_available: exact,
+    },
+    execution: {
+      exact,
+      results_path: resultsPath,
+      samples_considered: samplesConsidered,
+      rows: rows.length,
+      errors: rows.filter(row => row.error).length,
+      baseline_sources: baselineSources,
+      actual_candidate_tokens: actualCandidateTokens,
+      actual_baseline_tokens: actualBaselineTokens,
+    },
+  };
+
+  updated.savings = {
+    ...(metrics.savings || {}),
+    label: exact ? exactSavingsLabel(saved, actualBaselineTokens) : "baseline pending",
+    actual_tokens: exact ? actualCandidateTokens : metrics.savings?.actual_tokens ?? null,
+    estimated_xhigh_baseline_tokens: exact ? actualBaselineTokens : metrics.savings?.estimated_xhigh_baseline_tokens ?? null,
+    estimated_tokens_saved: exact ? saved : metrics.savings?.estimated_tokens_saved ?? null,
+    exact,
+  };
+  if (exact) {
+    updated.weakest_evidence = rows.some(row => row.error)
+      ? "Exact savings available for successful execution rows; some samples failed during counterfactual execution."
+      : "Exact savings available for sampled counterfactual executor calls.";
+  }
+  return updated;
+}
+
+function exactSavingsLabel(saved, baseline) {
+  return saved !== null && baseline ? `${saved} tokens / ${((saved / baseline) * 100).toFixed(1)}%` : "baseline pending";
 }
 
 function computeGates({ manifest, metrics, config }) {

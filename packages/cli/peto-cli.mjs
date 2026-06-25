@@ -6,6 +6,7 @@ import { hashText } from "../core/hash.mjs";
 import { appendJsonl, readJsonl } from "../core/jsonl.mjs";
 import {
   createVerificationRun,
+  executeVerificationRun,
   gateVerificationRun,
   reportVerificationRun,
   runVerification,
@@ -22,6 +23,7 @@ Usage:
   peto replay [--config FILE] [--log FILE] [--limit N] [--json]
   peto verify create --ticket FILE [--config FILE] [--json]
   peto verify run --id RUN_ID [--config FILE] [--json]
+  peto verify execute --id RUN_ID [--config FILE] [--dry-run] [--json]
   peto verify gate --id RUN_ID [--config FILE] [--json]
   peto verify report --id RUN_ID [--config FILE] [--json]
 
@@ -45,7 +47,7 @@ function parseArgs(argv) {
       continue;
     }
     const key = item.slice(2);
-    if (["json", "no-log", "help"].includes(key)) {
+    if (["json", "no-log", "help", "dry-run"].includes(key)) {
       args[key] = true;
       continue;
     }
@@ -122,6 +124,23 @@ function formatHuman(data) {
   }
   if (data.kind === "verify_create") return `verify run created: ${data.run_id}\n${data.run_dir}`;
   if (data.kind === "verify_run") return `verify run complete: ${data.run_id}\nsamples: ${data.samples.count}`;
+  if (data.kind === "verify_execute") {
+    if (data.dry_run) {
+      return [
+        `verify execution plan: ${data.run_id}`,
+        `samples: ${data.samples_considered}`,
+        `planned calls: ${data.planned}`,
+        ...(data.plan || []).map(item => `${item.route_id} ${item.source} ${item.effort}`),
+      ].join("\n");
+    }
+    return [
+      `verify execute complete: ${data.run_id}`,
+      `planned calls: ${data.planned}`,
+      `executed rows: ${data.executed}`,
+      `errors: ${data.errors}`,
+      data.results_path,
+    ].join("\n");
+  }
   if (data.kind === "verify_gate") return `verify verdict: ${data.verdict.verdict}`;
   if (data.kind === "verify_report") return `verify report: ${data.report_path}`;
   return JSON.stringify(data, null, 2);
@@ -295,13 +314,14 @@ function replay(args) {
   print({ kind: "replay", items: routes }, args.json);
 }
 
-function verify(args) {
+async function verify(args) {
   const subcommand = args._.shift();
   if (subcommand === "create") return print(createVerificationRun(args), args.json);
   if (subcommand === "run") return print(runVerification(args), args.json);
+  if (subcommand === "execute") return print(await executeVerificationRun(args), args.json);
   if (subcommand === "gate") return print(gateVerificationRun(args), args.json);
   if (subcommand === "report") return print(reportVerificationRun(args), args.json);
-  throw new Error("verify requires create, run, gate, or report.");
+  throw new Error("verify requires create, run, execute, gate, or report.");
 }
 
 async function main() {
