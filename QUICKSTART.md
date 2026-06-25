@@ -30,6 +30,7 @@ PETO_CONFIG=./peto.config.json npm run gateway
 mkdir -p memory/dispatcher/logs
 PETO_CONFIG=./peto.config.json npm run dispatcher:qwen > memory/dispatcher/logs/local-qwen-dispatcher.out.log 2>&1 &
 PETO_DISPATCHER_PID=$!
+sleep 3
 
 PETO_CONFIG=./peto.config.json npm run cli -- route "Summarize this request." --json
 PETO_CONFIG=./peto.config.json npm run cli -- eval
@@ -43,7 +44,7 @@ cat > memory/verification/quickstart-ticket.json <<'JSON'
 }
 JSON
 
-RUN_ID=$(PETO_CONFIG=./peto.config.json npm run cli --silent -- verify create \
+RUN_ID=$(PETO_CONFIG=./peto.config.json npm --silent run cli -- verify create \
   --ticket memory/verification/quickstart-ticket.json --json \
   | node --input-type=module -e "const d=await new Promise(r=>{let b='';process.stdin.on('data',c=>b+=c).on('end',()=>r(b))});console.log(JSON.parse(d).run_id)")
 PETO_CONFIG=./peto.config.json npm run cli -- verify run --id "$RUN_ID" --json
