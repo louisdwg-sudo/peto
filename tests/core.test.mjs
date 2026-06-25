@@ -669,3 +669,54 @@ test("verification execute enforces 50 sample limit and records upstream errors"
     await closeServer(server);
   }
 });
+
+test("verification gate does not use estimated savings after failed execution", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  writeJson(configPath, {
+    memoryPath: root,
+    logPath,
+    feedbackPath,
+    upstreamBaseUrl: "http://127.0.0.1:9",
+    defaultTargetModel: "mock-executor",
+    allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+  });
+  writeJson(ticketPath, {
+    id: "peto-verify-execute-failed-gate",
+    seed: 5,
+    sample_size: 1,
+    gates: { min_net_savings_ratio: 0.5 },
+    baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+  });
+  appendJsonl(logPath, {
+    id: "route-failed-execution",
+    phase: "request",
+    chosen_effort: "medium",
+    router_usage: { total_tokens: 1 },
+    profile_segment: "default",
+    request_class: "coding",
+    language: "en",
+    risk_tier: "low",
+    user_excerpt: "This upstream will fail.",
+  });
+  appendJsonl(logPath, {
+    id: "route-failed-execution",
+    phase: "response",
+    status: "ok",
+    executor_usage: { total_tokens: 100 },
+  });
+
+  const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+  runVerification({ config: configPath, id: created.run_id });
+  await executeVerificationRun({ config: configPath, id: created.run_id });
+  const gated = gateVerificationRun({ config: configPath, id: created.run_id });
+  const savingsGate = gated.gates.find(gate => gate.name === "min_net_savings_ratio");
+
+  assert.equal(savingsGate.pass, false);
+  assert.equal(savingsGate.observed, null);
+  assert.match(savingsGate.reason, /exact execution savings unavailable/);
+  assert.equal(gated.verdict.verdict, "hold");
+});
