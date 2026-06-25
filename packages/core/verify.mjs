@@ -125,9 +125,10 @@ export function gateVerificationRun(args = {}) {
   const manifest = readJson(path.join(runDir, "run-manifest.json"));
   const metrics = readJson(path.join(runDir, "metrics.json"));
   if (!metrics.kind) throw new Error(`Missing metrics.json for ${args.id}. Run verify run first.`);
-  const gates = computeGates({ manifest, metrics });
+  const gates = computeGates({ manifest, metrics, config });
   const hardFailures = gates.filter(gate => gate.severity === "hard" && !gate.pass);
   const softFailures = gates.filter(gate => gate.severity === "soft" && !gate.pass);
+  const humanReviewGate = gates.find(gate => gate.name === "human_review_queue_clear");
   const verdictValue = hardFailures.length ? "blocked" : softFailures.length ? "hold" : "promote";
   const verdict = {
     run_id: manifest.run_id,
@@ -136,8 +137,8 @@ export function gateVerificationRun(args = {}) {
     gates_failed: gates.filter(gate => !gate.pass).map(gate => gate.name),
     blocking_reason: unique(hardFailures.map(gate => gate.reason).filter(Boolean)).join("; ") || null,
     rollback_ref: null,
-    human_review_required: false,
-    human_review_queue_clear: true,
+    human_review_required: humanReviewGate?.pass === false,
+    human_review_queue_clear: humanReviewGate?.pass !== false,
   };
   writeJson(path.join(runDir, "gates.json"), { run_id: manifest.run_id, gates });
   writeJson(path.join(runDir, "verdict.json"), verdict);
@@ -315,7 +316,7 @@ function writeJsonlRows(file, rows) {
   fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""));
 }
 
-function computeGates({ manifest, metrics }) {
+function computeGates({ manifest, metrics, config }) {
   const gates = manifest.gates || DEFAULT_GATES;
   const validity = Number(metrics.routes?.validity_percent) / 100;
   const underfitRate = parsePercent(metrics.outcomes?.underfit_rate);
@@ -363,14 +364,34 @@ function computeGates({ manifest, metrics }) {
       threshold: gates.min_net_savings_ratio,
       pass: savingsRatio === null || savingsRatio >= gates.min_net_savings_ratio,
     },
-    {
-      name: "human_review_queue_clear",
-      severity: "hard",
-      observed: true,
-      threshold: true,
-      pass: true,
-    },
+    humanReviewQueueGate(config),
   ];
+}
+
+function humanReviewQueueGate(config = {}) {
+  const queuePath = config.humanReviewQueuePath;
+  if (!queuePath) {
+    return {
+      name: "human_review_queue_clear",
+      severity: "soft",
+      observed: "not_configured",
+      threshold: "empty",
+      pass: true,
+      note: "humanReviewQueuePath not configured; human review queue check skipped.",
+    };
+  }
+
+  const resolvedQueuePath = path.resolve(queuePath);
+  const text = fs.existsSync(resolvedQueuePath) ? fs.readFileSync(resolvedQueuePath, "utf8") : "";
+  const nonEmpty = text.trim().length > 0;
+  return {
+    name: "human_review_queue_clear",
+    severity: "soft",
+    observed: nonEmpty ? "non_empty" : "empty",
+    threshold: "empty",
+    pass: !nonEmpty,
+    note: nonEmpty ? `Human review queue is non-empty: ${resolvedQueuePath}` : `Human review queue is empty: ${resolvedQueuePath}`,
+  };
 }
 
 function parsePercent(value) {

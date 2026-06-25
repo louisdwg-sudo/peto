@@ -5,6 +5,8 @@ import path from "node:path";
 import { URL } from "node:url";
 import crypto from "node:crypto";
 
+import { parseSseUsage } from "../core/sse.mjs";
+
 const defaultConfigPath = path.resolve("peto.config.json");
 const configPath = process.env.PETO_CONFIG
   ? path.resolve(process.env.PETO_CONFIG)
@@ -422,28 +424,6 @@ function logRouteComplete({ id, status, statusCode, latencyMs, usage, error }) {
     annotations: [],
     error: error ? String(error).slice(0, 800) : null,
   });
-}
-
-function parseSseUsage(buffer) {
-  let usage = null;
-  const events = buffer.split(/\n\n+/);
-  for (const event of events) {
-    const dataLines = event
-      .split(/\n/)
-      .filter(line => line.startsWith("data:"))
-      .map(line => line.slice(5).trim())
-      .filter(line => line && line !== "[DONE]");
-    for (const line of dataLines) {
-      try {
-        const parsed = JSON.parse(line);
-        const candidate = parsed?.response?.usage ?? parsed?.usage;
-        if (candidate) usage = candidate;
-      } catch {
-        // Ignore non-JSON stream fragments.
-      }
-    }
-  }
-  return usage;
 }
 
 async function forwardToUpstream(req, res, body) {
