@@ -567,10 +567,9 @@ function computeGates({ manifest, metrics, config }) {
   const validity = Number(metrics.routes?.validity_percent) / 100;
   const underfitRate = parsePercent(metrics.outcomes?.underfit_rate);
   const overhead = metrics.dispatcher_overhead?.ratio;
-  const savingsRatio =
-    metrics.savings?.estimated_tokens_saved && metrics.savings?.estimated_xhigh_baseline_tokens
-      ? metrics.savings.estimated_tokens_saved / metrics.savings.estimated_xhigh_baseline_tokens
-      : null;
+  const executionAttempted = Boolean(metrics.execution);
+  const exactSavingsAvailable = metrics.savings?.exact === true;
+  const savingsRatio = executionAttempted && !exactSavingsAvailable ? null : savingsGateRatio(metrics);
   const telemetryOk = metrics.verification?.telemetry_preconditions?.ok !== false;
   return [
     {
@@ -608,10 +607,16 @@ function computeGates({ manifest, metrics, config }) {
       severity: "soft",
       observed: savingsRatio,
       threshold: gates.min_net_savings_ratio,
-      pass: savingsRatio === null || savingsRatio >= gates.min_net_savings_ratio,
+      pass: executionAttempted && !exactSavingsAvailable ? false : savingsRatio === null || savingsRatio >= gates.min_net_savings_ratio,
+      reason: executionAttempted && !exactSavingsAvailable ? "exact execution savings unavailable" : null,
     },
     humanReviewQueueGate(config),
   ];
+}
+
+function savingsGateRatio(metrics) {
+  if (!metrics.savings?.estimated_tokens_saved || !metrics.savings?.estimated_xhigh_baseline_tokens) return null;
+  return metrics.savings.estimated_tokens_saved / metrics.savings.estimated_xhigh_baseline_tokens;
 }
 
 function humanReviewQueueGate(config = {}) {
