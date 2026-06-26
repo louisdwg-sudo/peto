@@ -139,6 +139,8 @@ function formatHuman(data) {
       `planned calls: ${data.planned}`,
       `executed rows: ${data.executed}`,
       `errors: ${data.errors}`,
+      `errors by type: ${formatErrorsByType(data.errors_by_type)}`,
+      `distinct errors: ${formatDistinctErrors(data.distinct_errors)}`,
       data.results_path,
       data.quality_labels_path || "quality labels: skipped",
     ].join("\n");
@@ -343,6 +345,15 @@ async function main() {
 
 function formatMaybeNumber(value) {
   return Number.isFinite(value) ? value.toFixed(1) : "baseline pending";
+}
+
+function formatErrorsByType(errorsByType = {}) {
+  const entries = Object.entries(errorsByType);
+  return entries.length ? entries.map(([type, count]) => `${type}=${count}`).join(", ") : "none";
+}
+
+function formatDistinctErrors(errors = []) {
+  return errors.length ? errors.join(" | ") : "none";
 }
 
 main().catch(error => {

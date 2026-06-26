@@ -147,6 +147,7 @@ export async function executeVerificationRun(args = {}) {
 
   if (dryRun) return { ...base, plan };
 
+  preflightExecuteConfig(config);
   const rows = [];
   for (const item of plan) rows.push(await executePlanItem({ item, config }));
   const resultsPath = path.join(runDir, "execution-results.jsonl");
@@ -172,6 +173,7 @@ export async function executeVerificationRun(args = {}) {
     dry_run: false,
     executed: rows.length,
     errors: rows.filter(row => row.error).length,
+    ...executionErrorSummary(rows),
     results_path: resultsPath,
     quality_labels_path: qualityLabelsPath,
   };
@@ -430,8 +432,14 @@ async function executePlanItem({ item, config }) {
   const started = Date.now();
   if (!item.user_excerpt) {
     return executionRow(item, {
+      model: config.defaultTargetModel || null,
+      upstream_url: safeUpstreamResponsesUrl(config),
+      status_code: null,
+      attempts: 0,
       executor_usage: null,
+      response_text: null,
       latency_ms: null,
+      error_type: "missing_user_excerpt",
       error: "missing user_excerpt",
     });
   }
@@ -439,16 +447,26 @@ async function executePlanItem({ item, config }) {
   try {
     const result = await callUpstreamExecutor({ item, config });
     return executionRow(item, {
+      model: result.model,
+      upstream_url: result.upstream_url,
+      status_code: result.status_code,
+      attempts: result.attempts,
       executor_usage: result.executor_usage,
       response_text: item.source === "candidate" ? result.response_text : null,
       latency_ms: Date.now() - started,
+      error_type: null,
       error: null,
     });
   } catch (error) {
     return executionRow(item, {
+      model: error.model || config.defaultTargetModel || null,
+      upstream_url: error.upstream_url || safeUpstreamResponsesUrl(config),
+      status_code: error.status_code ?? null,
+      attempts: error.attempts ?? 0,
       executor_usage: null,
       response_text: null,
       latency_ms: Date.now() - started,
+      error_type: error.error_type || classifyExecutionError(error),
       error: error.message,
     });
   }
@@ -457,27 +475,32 @@ async function executePlanItem({ item, config }) {
 function executionRow(item, fields) {
   return {
     route_id: item.route_id,
-    effort: item.effort,
     source: item.source,
+    effort: item.effort,
+    model: fields.model ?? null,
+    upstream_url: fields.upstream_url ?? null,
+    status_code: fields.status_code ?? null,
+    attempts: fields.attempts ?? 0,
     executor_usage: fields.executor_usage,
     response_text: fields.response_text ?? null,
     latency_ms: fields.latency_ms,
+    error_type: fields.error_type ?? null,
     error: fields.error,
   };
 }
 
 async function callUpstreamExecutor({ item, config }) {
-  if (!config.upstreamBaseUrl) throw new Error("verify execute requires upstreamBaseUrl in config.");
-  if (!config.defaultTargetModel) throw new Error("verify execute requires defaultTargetModel in config.");
+  const upstream_url = upstreamResponsesUrl(config).toString();
+  const model = config.defaultTargetModel;
 
   let lastError = null;
   for (let attempt = 1; attempt <= RATE_LIMIT_ATTEMPTS; attempt += 1) {
     try {
-      const response = await fetch(upstreamResponsesUrl(config), {
+      const response = await fetch(upstream_url, {
         method: "POST",
         headers: upstreamHeaders(config),
         body: JSON.stringify({
-          model: config.defaultTargetModel,
+          model,
           input: item.user_excerpt,
           reasoning: { effort: item.effort },
         }),
@@ -487,15 +510,44 @@ async function callUpstreamExecutor({ item, config }) {
         await sleep((config.verifyExecuteRetryBaseMs || 250) * 2 ** (attempt - 1));
         continue;
       }
-      if (!response.ok) throw new Error(`Upstream ${response.status}: ${raw.slice(0, 500)}`);
+      if (!response.ok) {
+        throw executionError({
+          message: `Upstream ${response.status} ${httpStatusDiagnostic(response.status)}: ${raw.slice(0, 500)}`,
+          model,
+          upstream_url,
+          status_code: response.status,
+          attempts: attempt,
+          error_type: String(response.status),
+        });
+      }
+      let executor_usage = null;
+      let response_text = null;
+      try {
+        executor_usage = extractUsage(raw);
+        response_text = extractResponseText(raw);
+      } catch (error) {
+        throw executionError({
+          message: error.message,
+          model,
+          upstream_url,
+          status_code: response.status,
+          attempts: attempt,
+          error_type: "parse",
+        });
+      }
       return {
-        executor_usage: extractUsage(raw),
-        response_text: extractResponseText(raw),
+        model,
+        upstream_url,
+        status_code: response.status,
+        attempts: attempt,
+        executor_usage,
+        response_text,
       };
     } catch (error) {
-      lastError = error;
-      if (!/fetch failed|network|ECONN|ENOTFOUND|ETIMEDOUT/i.test(error.message)) throw error;
-      break;
+      const enriched = enrichExecutionError(error, { model, upstream_url, attempts: attempt });
+      lastError = enriched;
+      if (!["network", "429"].includes(enriched.error_type)) throw enriched;
+      if (enriched.error_type === "network") break;
     }
   }
   throw lastError;
@@ -503,6 +555,14 @@ async function callUpstreamExecutor({ item, config }) {
 
 function upstreamResponsesUrl(config) {
   return new URL("/v1/responses", config.upstreamBaseUrl);
+}
+
+function safeUpstreamResponsesUrl(config) {
+  try {
+    return config.upstreamBaseUrl ? upstreamResponsesUrl(config).toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 function upstreamHeaders(config) {
@@ -515,6 +575,88 @@ function upstreamHeaders(config) {
   const token = config.upstreamApiKey || config.apiKey || config.openaiApiKey || process.env.OPENAI_API_KEY;
   if (token && !hasAuthorization) headers.authorization = `Bearer ${token}`;
   return headers;
+}
+
+function preflightExecuteConfig(config) {
+  const missing = [];
+  if (!config.upstreamBaseUrl) missing.push("upstreamBaseUrl");
+  if (!config.defaultTargetModel) missing.push("defaultTargetModel");
+  if (!hasUpstreamAuthorization(config)) missing.push("Authorization header or upstreamApiKey/apiKey/openaiApiKey/OPENAI_API_KEY");
+  if (!missing.length) return;
+  const error = new Error(`verify execute preflight failed: missing ${missing.join(", ")}.`);
+  error.error_type = "config";
+  throw error;
+}
+
+function hasUpstreamAuthorization(config) {
+  const headers = config.upstreamHeaders || {};
+  const hasAuthorization = Object.keys(headers).some(key => key.toLowerCase() === "authorization");
+  return Boolean(
+    hasAuthorization ||
+      config.upstreamApiKey ||
+      config.apiKey ||
+      config.openaiApiKey ||
+      process.env.OPENAI_API_KEY,
+  );
+}
+
+function executionError({ message, model, upstream_url, status_code = null, attempts = 0, error_type }) {
+  const error = new Error(message);
+  error.model = model;
+  error.upstream_url = upstream_url;
+  error.status_code = status_code;
+  error.attempts = attempts;
+  error.error_type = error_type;
+  return error;
+}
+
+function enrichExecutionError(error, { model, upstream_url, attempts }) {
+  if (error.error_type) {
+    error.model ||= model;
+    error.upstream_url ||= upstream_url;
+    error.attempts ||= attempts;
+    return error;
+  }
+  return executionError({
+    message: error.message,
+    model,
+    upstream_url,
+    attempts,
+    error_type: classifyExecutionError(error),
+  });
+}
+
+function httpStatusDiagnostic(status) {
+  if (status === 401) return "auth failure";
+  if (status === 404) return "endpoint mismatch";
+  if (status === 429) return "rate limit";
+  if (status >= 500) return "upstream failure";
+  return "upstream failure";
+}
+
+function classifyExecutionError(error) {
+  if (error.error_type) return error.error_type;
+  if (error.status_code) return String(error.status_code);
+  if (/missing user_excerpt/i.test(error.message)) return "missing_user_excerpt";
+  if (/non-JSON|JSON/i.test(error.message)) return "parse";
+  if (/fetch failed|network|ECONN|ENOTFOUND|ETIMEDOUT|ECONNREFUSED/i.test(error.message)) return "network";
+  return "upstream";
+}
+
+function executionErrorSummary(rows) {
+  const errors = rows.filter(row => row.error);
+  const errorsByType = {};
+  const distinctErrors = [];
+  const seen = new Set();
+  for (const row of errors) {
+    const type = row.error_type || classifyExecutionError(row);
+    errorsByType[type] = (errorsByType[type] || 0) + 1;
+    if (!seen.has(row.error)) {
+      seen.add(row.error);
+      if (distinctErrors.length < 3) distinctErrors.push(row.error);
+    }
+  }
+  return { distinct_errors: distinctErrors, errors_by_type: errorsByType };
 }
 
 function extractUsage(raw) {
@@ -574,6 +716,7 @@ function sleep(ms) {
 function updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConsidered }) {
   const candidateRows = rows.filter(row => row.source === "candidate" && !row.error);
   const baselineRows = rows.filter(row => row.source.startsWith("baseline_") && !row.error);
+  const errorSummary = executionErrorSummary(rows);
   const actualCandidateTokens = sumUsageTokens(candidateRows.map(row => row.executor_usage));
   const actualBaselineTokens = sumUsageTokens(baselineRows.map(row => row.executor_usage));
   const exact = actualCandidateTokens !== null && actualBaselineTokens !== null;
@@ -594,6 +737,8 @@ function updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConside
       baseline_sources: baselineSources,
       actual_candidate_tokens: actualCandidateTokens,
       actual_baseline_tokens: actualBaselineTokens,
+      distinct_errors: errorSummary.distinct_errors,
+      errors_by_type: errorSummary.errors_by_type,
     },
   };
 

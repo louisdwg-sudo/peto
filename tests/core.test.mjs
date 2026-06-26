@@ -556,6 +556,7 @@ test("verification execute writes execution results and updates metrics with rea
       logPath,
       feedbackPath,
       upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      upstreamHeaders: { Authorization: "Bearer test-token" },
       defaultTargetModel: "mock-executor",
       allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
     });
@@ -633,6 +634,7 @@ test("verification execute enforces 50 sample limit and records upstream errors"
       logPath,
       feedbackPath,
       upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      upstreamHeaders: { Authorization: "Bearer test-token" },
       defaultTargetModel: "mock-executor",
       allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
     });
@@ -682,6 +684,7 @@ test("verification gate does not use estimated savings after failed execution", 
     logPath,
     feedbackPath,
     upstreamBaseUrl: "http://127.0.0.1:9",
+    upstreamHeaders: { Authorization: "Bearer test-token" },
     defaultTargetModel: "mock-executor",
     allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
   });
@@ -714,12 +717,244 @@ test("verification gate does not use estimated savings after failed execution", 
   runVerification({ config: configPath, id: created.run_id });
   await executeVerificationRun({ config: configPath, id: created.run_id });
   const gated = gateVerificationRun({ config: configPath, id: created.run_id });
+  const metrics = JSON.parse(fs.readFileSync(path.join(created.run_dir, "metrics.json"), "utf8"));
+  const rows = readJsonl(path.join(created.run_dir, "execution-results.jsonl")).rows;
   const savingsGate = gated.gates.find(gate => gate.name === "min_net_savings_ratio");
 
+  assert.equal(rows.every(row => row.error_type === "network"), true);
+  assert.equal(metrics.execution.exact, false);
+  assert.equal(metrics.execution.errors, 2);
+  assert.equal(metrics.execution.actual_candidate_tokens, null);
+  assert.equal(metrics.execution.actual_baseline_tokens, null);
   assert.equal(savingsGate.pass, false);
   assert.equal(savingsGate.observed, null);
   assert.match(savingsGate.reason, /exact execution savings unavailable/);
   assert.equal(gated.verdict.verdict, "hold");
+});
+
+test("verification execute fails preflight before calls when auth is missing", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  let calls = 0;
+  const server = http.createServer((req, res) => {
+    calls += 1;
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ usage: { total_tokens: 10 } }));
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      defaultTargetModel: "mock-executor",
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-execute-missing-auth",
+      seed: 6,
+      sample_size: 1,
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    appendJsonl(logPath, {
+      id: "route-missing-auth",
+      phase: "request",
+      chosen_effort: "medium",
+      profile_segment: "default",
+      request_class: "coding",
+      language: "en",
+      risk_tier: "low",
+      user_excerpt: "Explain missing auth.",
+    });
+    appendJsonl(logPath, { id: "route-missing-auth", phase: "response", status: "ok" });
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+
+    await assert.rejects(
+      () => executeVerificationRun({ config: configPath, id: created.run_id }),
+      /preflight.*Authorization/i,
+    );
+    assert.equal(calls, 0);
+    assert.equal(fs.existsSync(path.join(created.run_dir, "execution-results.jsonl")), false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("verification execute records 401 upstream responses with diagnostic summary", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  const server = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "bad api key" }));
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      upstreamHeaders: { Authorization: "Bearer bad-token" },
+      defaultTargetModel: "mock-executor",
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-execute-401",
+      seed: 7,
+      sample_size: 1,
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    appendJsonl(logPath, {
+      id: "route-auth-failure",
+      phase: "request",
+      chosen_effort: "medium",
+      profile_segment: "default",
+      request_class: "coding",
+      language: "en",
+      risk_tier: "low",
+      user_excerpt: "Explain auth failure.",
+    });
+    appendJsonl(logPath, { id: "route-auth-failure", phase: "response", status: "ok" });
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+    const result = await executeVerificationRun({ config: configPath, id: created.run_id });
+    const rows = readJsonl(path.join(created.run_dir, "execution-results.jsonl")).rows;
+    const metrics = JSON.parse(fs.readFileSync(path.join(created.run_dir, "metrics.json"), "utf8"));
+
+    assert.equal(result.executed, 2);
+    assert.equal(result.errors, 2);
+    assert.deepEqual(result.errors_by_type, { "401": 2 });
+    assert.deepEqual(result.distinct_errors, ["Upstream 401 auth failure: {\"error\":\"bad api key\"}"]);
+    assert.ok(rows.every(row => row.status_code === 401));
+    assert.ok(rows.every(row => row.error_type === "401"));
+    assert.ok(rows.every(row => row.model === "mock-executor"));
+    assert.ok(rows.every(row => row.upstream_url === `http://127.0.0.1:${port}/v1/responses`));
+    assert.equal(metrics.execution.exact, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("verification execute records 404 upstream responses with diagnostic summary", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  const server = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not found");
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      upstreamHeaders: { Authorization: "Bearer test-token" },
+      defaultTargetModel: "mock-executor",
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-execute-404",
+      seed: 8,
+      sample_size: 1,
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    appendJsonl(logPath, {
+      id: "route-endpoint-mismatch",
+      phase: "request",
+      chosen_effort: "medium",
+      profile_segment: "default",
+      request_class: "coding",
+      language: "en",
+      risk_tier: "low",
+      user_excerpt: "Explain endpoint mismatch.",
+    });
+    appendJsonl(logPath, { id: "route-endpoint-mismatch", phase: "response", status: "ok" });
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+    const result = await executeVerificationRun({ config: configPath, id: created.run_id });
+    const rows = readJsonl(path.join(created.run_dir, "execution-results.jsonl")).rows;
+
+    assert.equal(result.executed, 2);
+    assert.equal(result.errors, 2);
+    assert.deepEqual(result.errors_by_type, { "404": 2 });
+    assert.deepEqual(result.distinct_errors, ["Upstream 404 endpoint mismatch: not found"]);
+    assert.ok(rows.every(row => row.status_code === 404));
+    assert.ok(rows.every(row => row.error_type === "404"));
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("verification execute records parse failures with status code", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  const server = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("not-json");
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      upstreamHeaders: { Authorization: "Bearer test-token" },
+      defaultTargetModel: "mock-executor",
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-execute-parse",
+      seed: 9,
+      sample_size: 1,
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    appendJsonl(logPath, {
+      id: "route-parse-failure",
+      phase: "request",
+      chosen_effort: "medium",
+      profile_segment: "default",
+      request_class: "coding",
+      language: "en",
+      risk_tier: "low",
+      user_excerpt: "Explain parse failure.",
+    });
+    appendJsonl(logPath, { id: "route-parse-failure", phase: "response", status: "ok" });
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+    const result = await executeVerificationRun({ config: configPath, id: created.run_id });
+    const rows = readJsonl(path.join(created.run_dir, "execution-results.jsonl")).rows;
+
+    assert.equal(result.errors, 2);
+    assert.deepEqual(result.errors_by_type, { parse: 2 });
+    assert.ok(rows.every(row => row.status_code === 200));
+    assert.ok(rows.every(row => row.error_type === "parse"));
+  } finally {
+    await closeServer(server);
+  }
 });
 
 test("judgeRoute returns ambiguous on unparseable judge output", async () => {
@@ -794,6 +1029,7 @@ test("verification execute writes quality labels for candidate responses only", 
       logPath,
       feedbackPath,
       upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      upstreamHeaders: { Authorization: "Bearer test-token" },
       defaultTargetModel: "mock-executor",
       judgeModel: "mock-judge",
       judgeEffort: "low",
@@ -880,6 +1116,7 @@ test("verification execute skips quality judge when disabled", async () => {
       logPath,
       feedbackPath,
       upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      upstreamHeaders: { Authorization: "Bearer test-token" },
       defaultTargetModel: "mock-executor",
       judgeModel: "mock-judge",
       enableQualityJudge: false,
