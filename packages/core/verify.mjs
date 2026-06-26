@@ -17,6 +17,7 @@ const DEFAULT_GATES = {
 
 const EXECUTION_SAMPLE_LIMIT = 50;
 const RATE_LIMIT_ATTEMPTS = 3;
+const DEFAULT_EXECUTE_TIMEOUT_MS = 120_000;
 
 export function createVerificationRun(args = {}) {
   const config = loadConfig(args);
@@ -496,7 +497,7 @@ async function callUpstreamExecutor({ item, config }) {
   let lastError = null;
   for (let attempt = 1; attempt <= RATE_LIMIT_ATTEMPTS; attempt += 1) {
     try {
-      const response = await fetch(upstream_url, {
+      const response = await fetchWithTimeout(upstream_url, {
         method: "POST",
         headers: upstreamHeaders(config),
         body: JSON.stringify({
@@ -504,7 +505,7 @@ async function callUpstreamExecutor({ item, config }) {
           input: item.user_excerpt,
           reasoning: { effort: item.effort },
         }),
-      });
+      }, executionTimeoutMs(config));
       const raw = await response.text();
       if (response.status === 429 && attempt < RATE_LIMIT_ATTEMPTS) {
         await sleep((config.verifyExecuteRetryBaseMs || 250) * 2 ** (attempt - 1));
@@ -545,6 +546,9 @@ async function callUpstreamExecutor({ item, config }) {
       };
     } catch (error) {
       const enriched = enrichExecutionError(error, { model, upstream_url, attempts: attempt });
+      if (enriched.error_type === "timeout") {
+        enriched.message = `Upstream request timed out after ${executionTimeoutMs(config)}ms.`;
+      }
       lastError = enriched;
       if (!["network", "429"].includes(enriched.error_type)) throw enriched;
       if (enriched.error_type === "network") break;
@@ -555,6 +559,21 @@ async function callUpstreamExecutor({ item, config }) {
 
 function upstreamResponsesUrl(config) {
   return new URL("/v1/responses", config.upstreamBaseUrl);
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function executionTimeoutMs(config) {
+  const timeout = Number(config.verifyExecuteTimeoutMs);
+  return Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_EXECUTE_TIMEOUT_MS;
 }
 
 function safeUpstreamResponsesUrl(config) {
@@ -637,6 +656,7 @@ function httpStatusDiagnostic(status) {
 function classifyExecutionError(error) {
   if (error.error_type) return error.error_type;
   if (error.status_code) return String(error.status_code);
+  if (/AbortError|aborted|abort/i.test(error.name || "") || /AbortError|aborted|abort/i.test(error.message)) return "timeout";
   if (/missing user_excerpt/i.test(error.message)) return "missing_user_excerpt";
   if (/non-JSON|JSON/i.test(error.message)) return "parse";
   if (/fetch failed|network|ECONN|ENOTFOUND|ETIMEDOUT|ECONNREFUSED/i.test(error.message)) return "network";

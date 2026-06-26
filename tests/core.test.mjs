@@ -957,6 +957,64 @@ test("verification execute records parse failures with status code", async () =>
   }
 });
 
+test("verification execute times out hanging upstream responses", async () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  const server = http.createServer((req, res) => {
+    req.resume();
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ usage: { total_tokens: 10 } }));
+    }, 200);
+  });
+  const port = await listen(server);
+  try {
+    writeJson(configPath, {
+      memoryPath: root,
+      logPath,
+      feedbackPath,
+      upstreamBaseUrl: `http://127.0.0.1:${port}`,
+      upstreamHeaders: { Authorization: "Bearer test-token" },
+      defaultTargetModel: "mock-executor",
+      verifyExecuteTimeoutMs: 20,
+      allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+    });
+    writeJson(ticketPath, {
+      id: "peto-verify-execute-timeout",
+      seed: 10,
+      sample_size: 1,
+      baselines: [{ name: "fixed_xhigh", type: "fixed_effort", effort: "xhigh" }],
+    });
+    appendJsonl(logPath, {
+      id: "route-timeout",
+      phase: "request",
+      chosen_effort: "medium",
+      profile_segment: "default",
+      request_class: "coding",
+      language: "en",
+      risk_tier: "low",
+      user_excerpt: "Explain timeout.",
+    });
+    appendJsonl(logPath, { id: "route-timeout", phase: "response", status: "ok" });
+
+    const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+    runVerification({ config: configPath, id: created.run_id });
+    const result = await executeVerificationRun({ config: configPath, id: created.run_id });
+    const rows = readJsonl(path.join(created.run_dir, "execution-results.jsonl")).rows;
+
+    assert.equal(result.errors, 2);
+    assert.deepEqual(result.errors_by_type, { timeout: 2 });
+    assert.ok(rows.every(row => row.error_type === "timeout"));
+    assert.ok(rows.every(row => row.attempts === 1));
+    assert.match(result.distinct_errors[0], /timed out/i);
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test("judgeRoute returns ambiguous on unparseable judge output", async () => {
   const server = http.createServer((req, res) => {
     req.resume();
