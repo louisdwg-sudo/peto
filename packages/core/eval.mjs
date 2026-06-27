@@ -1,6 +1,6 @@
 import { EFFORTS, loadConfig } from "./config.mjs";
 import { readJsonl } from "./jsonl.mjs";
-import { normalizeAcceptanceLabel, normalizeRouteEvent } from "./telemetry.mjs";
+import { OPTIMIZATION_SEGMENTS, normalizeAcceptanceLabel, normalizeRouteEvent } from "./telemetry.mjs";
 
 export function groupRoutes(events) {
   const normalized = events.map(normalizeRouteEvent);
@@ -193,6 +193,7 @@ export function evaluateRows({ routerRows, invalidRows = 0, feedbackRows = [], c
       ? "Run matched xhigh counterfactuals for representative accepted routes."
       : "Run `peto route` or the gateway, then collect reviewer outcomes.",
     effort_breakdown: effortBreakdown(routes, labels),
+    optimization_segments: optimizationSegmentBreakdown(routes, labels),
     low_minimal_trend: lowMinimalTrend(routes),
   };
 }
@@ -224,6 +225,42 @@ function effortBreakdown(routes, labels) {
       underfit_rate: percent(underfitCount, slice.length),
       rejection_rate: percent(rejectedCount, slice.length),
     };
+  }
+  return breakdown;
+}
+
+function optimizationSegmentBreakdown(routes, labels) {
+  const breakdown = Object.fromEntries(
+    OPTIMIZATION_SEGMENTS.map(segment => [
+      segment,
+      {
+        count: 0,
+        accepted: 0,
+        underfit: 0,
+        rejected: 0,
+        ambiguous: 0,
+        underfit_rate: percent(0, 0),
+        rejection_rate: percent(0, 0),
+        acceptance_rate: percent(0, 0),
+      },
+    ]),
+  );
+
+  for (const route of routes) {
+    const segment = route.request.optimization_segment || "effort_sensitive";
+    const bucket = breakdown[segment] || breakdown.effort_sensitive;
+    const label = labels.get(route.request.route_id);
+    bucket.count += 1;
+    if (label === "accepted" || (!label && !isFailedResponse(route.response))) bucket.accepted += 1;
+    if (label === "underfit") bucket.underfit += 1;
+    if (label === "rejected") bucket.rejected += 1;
+    if (label === "ambiguous") bucket.ambiguous += 1;
+  }
+
+  for (const bucket of Object.values(breakdown)) {
+    bucket.underfit_rate = percent(bucket.underfit, bucket.count);
+    bucket.rejection_rate = percent(bucket.rejected + bucket.ambiguous, bucket.count);
+    bucket.acceptance_rate = percent(bucket.accepted, bucket.count);
   }
   return breakdown;
 }

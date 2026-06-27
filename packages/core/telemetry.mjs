@@ -1,6 +1,7 @@
 export const TELEMETRY_SCHEMA_VERSION = "1.0";
 export const ACCEPTANCE_LABELS = ["accepted", "underfit", "overfit", "rejected", "ambiguous", "invalid"];
 export const REQUEST_CLASSES = ["codex_suggestions", "session_restore", "memory_extraction", "coding_help", "other"];
+export const OPTIMIZATION_SEGMENTS = ["effort_sensitive", "capability_sensitive"];
 
 export function normalizeRouteEvent(event = {}) {
   const routeId = event.route_id || event.id || null;
@@ -29,6 +30,7 @@ export function normalizeRouteEvent(event = {}) {
     normalized.request_class = requestTelemetry.request_class;
     normalized.connected_app_required = requestTelemetry.connected_app_required;
     normalized.memory_lookup_needed = requestTelemetry.memory_lookup_needed;
+    normalized.optimization_segment = classifyOptimizationSegment(normalized);
     normalized.verification_missing_fields = explicitSchemaVersion
       ? requiredVerificationFields().filter(key => {
         if (key === "request_class") return normalized.request_class === "unknown";
@@ -77,6 +79,15 @@ export function classifyRequestTelemetry(event = {}) {
     connected_app_required: connectedAppRequired,
     memory_lookup_needed: memoryLookupNeeded,
   };
+}
+
+export function classifyOptimizationSegment(event = {}) {
+  if (event.optimization_segment && OPTIMIZATION_SEGMENTS.includes(event.optimization_segment)) {
+    return event.optimization_segment;
+  }
+  return event.request_class === "codex_suggestions" && event.connected_app_required === true
+    ? "capability_sensitive"
+    : "effort_sensitive";
 }
 
 export function annotateRouteEvent(event, annotation) {

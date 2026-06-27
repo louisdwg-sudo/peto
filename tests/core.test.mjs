@@ -18,7 +18,7 @@ import {
   runVerification,
 } from "../packages/core/verify.mjs";
 import { writeFeedback } from "../packages/core/feedback.mjs";
-import { classifyRequestTelemetry, normalizeRouteEvent } from "../packages/core/telemetry.mjs";
+import { classifyOptimizationSegment, classifyRequestTelemetry, normalizeRouteEvent } from "../packages/core/telemetry.mjs";
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "peto-core-test-"));
@@ -128,6 +128,18 @@ test("normalizeRouteEvent backfills request telemetry from excerpts", () => {
   assert.deepEqual(normalized.verification_missing_fields, []);
 });
 
+test("classifyOptimizationSegment separates capability-sensitive prompt shapes from effort-sensitive traffic", () => {
+  assert.equal(
+    classifyOptimizationSegment({ request_class: "codex_suggestions", connected_app_required: true }),
+    "capability_sensitive",
+  );
+  assert.equal(
+    classifyOptimizationSegment({ request_class: "codex_suggestions", connected_app_required: false }),
+    "effort_sensitive",
+  );
+  assert.equal(classifyOptimizationSegment({ request_class: "coding_help" }), "effort_sensitive");
+});
+
 test("evalLogs splits router and executor usage and honors explicit feedback labels", () => {
   const root = makeTempDir();
   const logPath = path.join(root, "router-events.jsonl");
@@ -212,6 +224,54 @@ test("evalLogs does not count feedback_signal routes as accepted and emits effor
   assert.ok(data.effort_breakdown.medium, "effort_breakdown should have a medium entry");
   assert.equal(data.effort_breakdown.medium.count, 2);
   assert.equal(typeof data.low_minimal_trend, "object");
+});
+
+test("evalLogs emits effort-sensitive and capability-sensitive outcome segments", () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  writeJson(configPath, { memoryPath: root, logPath, feedbackPath, localRouterUrl: "http://127.0.0.1:9/route" });
+
+  appendJsonl(logPath, {
+    id: "capability-route",
+    phase: "request",
+    chosen_effort: "medium",
+    request_class: "codex_suggestions",
+    connected_app_required: true,
+    router_usage: { total_tokens: 4 },
+  });
+  appendJsonl(logPath, { id: "capability-route", phase: "response", status: "ok", executor_usage: { total_tokens: 50 } });
+  appendJsonl(logPath, {
+    id: "effort-route",
+    phase: "request",
+    chosen_effort: "low",
+    request_class: "coding_help",
+    connected_app_required: false,
+    router_usage: { total_tokens: 3 },
+  });
+  appendJsonl(logPath, { id: "effort-route", phase: "response", status: "ok", executor_usage: { total_tokens: 40 } });
+  appendJsonl(feedbackPath, {
+    id: "capability-route",
+    route_id: "capability-route",
+    acceptance_label: "underfit",
+    signal: "quality_judge",
+  });
+  appendJsonl(feedbackPath, {
+    id: "effort-route",
+    route_id: "effort-route",
+    acceptance_label: "accepted",
+    signal: "quality_judge",
+  });
+
+  const data = evalLogs({ config: configPath });
+
+  assert.equal(data.optimization_segments.capability_sensitive.count, 1);
+  assert.equal(data.optimization_segments.capability_sensitive.underfit, 1);
+  assert.equal(data.optimization_segments.capability_sensitive.underfit_rate, "100.0%");
+  assert.equal(data.optimization_segments.effort_sensitive.count, 1);
+  assert.equal(data.optimization_segments.effort_sensitive.accepted, 1);
+  assert.equal(data.optimization_segments.effort_sensitive.underfit_rate, "0.0%");
 });
 
 test("evalLogs counts explicitly accepted routes even when the response failed", () => {
@@ -415,6 +475,7 @@ test("verification run produces deterministic samples, metrics, gates, verdict, 
 
   assert.equal(run.samples.count, 2);
   assert.equal(typeof run.samples.sha256, "string");
+  assert.equal(typeof run.metrics.optimization_segments.effort_sensitive, "object");
   assert.equal(fs.existsSync(path.join(created.run_dir, "candidate-routes.jsonl")), true);
   assert.equal(fs.existsSync(path.join(created.run_dir, "baseline-routes.fixed_xhigh.jsonl")), true);
   assert.equal(run.metrics.cost_per_accepted_outcome.tokens > 0, true);
@@ -427,7 +488,11 @@ test("verification run produces deterministic samples, metrics, gates, verdict, 
   assert.equal(gated.verdict.human_review_required, false);
   assert.equal(gated.verdict.human_review_queue_clear, true);
   assert.equal(reported.report_path.endsWith("report.md"), true);
-  assert.match(fs.readFileSync(reported.report_path, "utf8"), /PETO Verification Report/);
+  const reportText = fs.readFileSync(reported.report_path, "utf8");
+  assert.match(reportText, /PETO Verification Report/);
+  assert.match(reportText, /Optimization segments/);
+  assert.match(reportText, /effort_sensitive/);
+  assert.match(reportText, /capability_sensitive/);
 });
 
 test("verification gate soft-fails when configured human review queue is non-empty", () => {
@@ -576,6 +641,88 @@ test("verification run backfills request class and prompt-shape telemetry into s
   assert.equal(samples[0].request_class, "codex_suggestions");
   assert.equal(samples[0].connected_app_required, true);
   assert.equal(samples[0].memory_lookup_needed, false);
+  assert.equal(samples[0].optimization_segment, "capability_sensitive");
+});
+
+test("verification run and report segment the current sample with existing quality labels", () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  writeJson(configPath, {
+    memoryPath: root,
+    logPath,
+    feedbackPath,
+    allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+  });
+  writeJson(ticketPath, {
+    id: "peto-verify-quality-segments",
+    seed: 3,
+    sample_size: 2,
+  });
+  appendJsonl(logPath, {
+    id: "capability-route",
+    route_id: "capability-route",
+    schema_version: "1.0",
+    phase: "request",
+    chosen_effort: "medium",
+    router_usage: { total_tokens: 4 },
+    profile_segment: "default",
+    language: "en",
+    risk_tier: "low",
+    request_class: "unknown",
+    user_excerpt: "Generate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex by deeply viewing connected apps.",
+  });
+  appendJsonl(logPath, {
+    id: "capability-route",
+    route_id: "capability-route",
+    schema_version: "1.0",
+    phase: "response",
+    status: "ok",
+    executor_usage: { total_tokens: 60 },
+  });
+  appendJsonl(logPath, {
+    id: "effort-route",
+    route_id: "effort-route",
+    schema_version: "1.0",
+    phase: "request",
+    chosen_effort: "low",
+    router_usage: { total_tokens: 3 },
+    profile_segment: "default",
+    language: "en",
+    risk_tier: "low",
+    request_class: "coding_help",
+    user_excerpt: "Debug the failing npm test.",
+  });
+  appendJsonl(logPath, {
+    id: "effort-route",
+    route_id: "effort-route",
+    schema_version: "1.0",
+    phase: "response",
+    status: "ok",
+    executor_usage: { total_tokens: 40 },
+  });
+
+  const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+  fs.writeFileSync(path.join(created.run_dir, "quality-labels.jsonl"), [
+    JSON.stringify({ route_id: "capability-route", acceptance_label: "underfit", signal: "quality_judge" }),
+    JSON.stringify({ route_id: "effort-route", acceptance_label: "accepted", signal: "quality_judge" }),
+    "",
+  ].join("\n"));
+
+  const run = runVerification({ config: configPath, id: created.run_id });
+  const report = reportVerificationRun({ config: configPath, id: created.run_id });
+  const reportText = fs.readFileSync(report.report_path, "utf8");
+  const samples = readJsonl(path.join(created.run_dir, "samples.jsonl")).rows;
+
+  assert.equal(run.metrics.verification.optimization_segments.capability_sensitive.count, 1);
+  assert.equal(run.metrics.verification.optimization_segments.capability_sensitive.underfit, 1);
+  assert.equal(run.metrics.verification.optimization_segments.capability_sensitive.underfit_rate, "100.0%");
+  assert.equal(run.metrics.verification.optimization_segments.effort_sensitive.accepted, 1);
+  assert.equal(samples.find(row => row.route_id === "capability-route").acceptance_label, "underfit");
+  assert.match(reportText, /capability_sensitive: count 1, underfit 100.0%/);
+  assert.match(reportText, /effort_sensitive: count 1, underfit 0.0%/);
 });
 
 test("parseSseUsage returns usage from final data event and null for malformed streams", () => {

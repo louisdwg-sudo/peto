@@ -35,6 +35,7 @@ Every route should log:
   "request_class": "codex_suggestions|session_restore|memory_extraction|coding_help|other",
   "connected_app_required": false,
   "memory_lookup_needed": false,
+  "optimization_segment": "effort_sensitive|capability_sensitive",
   "router_model": "string",
   "router_effort": "string",
   "router_confidence": 0.0,
@@ -108,6 +109,8 @@ npm run cli -- verify report --id peto-verify-run
 - weakest evidence and the next test needed
 
 The CLI should not claim exact savings without real counterfactual xhigh runs. When logs do not contain enough usage or feedback data, it must say `baseline pending` and name the missing evidence.
+
+`optimization_segment` is a reporting-only derived field. `codex_suggestions` requests that require connected app context are `capability_sensitive`; all other traffic is `effort_sensitive`. This segmentation makes PETO's effort-routing performance legible without changing routing behavior.
 
 `peto verify` writes deterministic offline verification artifacts under `memory/verification/runs/<run_id>/`. V1 verification runs the candidate router and fixed baselines over logged samples only; it does not execute user requests or invoke RouteLLM unless a later explicit comparator ticket adds that behavior.
 

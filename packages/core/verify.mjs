@@ -2,11 +2,16 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { EFFORTS, loadConfig } from "./config.mjs";
-import { evaluateRows, feedbackLabelMap, groupRoutes, sumUsageTokens } from "./eval.mjs";
+import { evaluateRows, feedbackLabelMap, groupRoutes, percent, sumUsageTokens } from "./eval.mjs";
 import { hashText, sha256Text, stableJson } from "./hash.mjs";
 import { judgeRoute } from "./judge.mjs";
 import { readJson, readJsonl, writeJson } from "./jsonl.mjs";
-import { classifyRequestTelemetry, validateVerificationFields } from "./telemetry.mjs";
+import {
+  OPTIMIZATION_SEGMENTS,
+  classifyOptimizationSegment,
+  classifyRequestTelemetry,
+  validateVerificationFields,
+} from "./telemetry.mjs";
 
 const DEFAULT_GATES = {
   min_route_json_validity: 0.99,
@@ -54,15 +59,18 @@ export function runVerification(args = {}) {
 
   const routerLog = readJsonl(config.logPath);
   const feedback = readJsonl(config.feedbackPath);
+  const qualityLabels = readQualityLabels(runDir);
+  const feedbackRows = [...feedback.rows, ...qualityLabels.rows];
   const routes = groupRoutes(routerLog.rows);
   const missing = collectMissingVerificationFields(routes);
-  const labels = feedbackLabelMap(feedback.rows);
+  const labels = feedbackLabelMap(feedbackRows);
   const samples = curateSamples(routes, labels, {
     seed: manifest.seed,
     sampleSize: Number(manifest.ticket?.sample_size || 20),
   });
   const sampleRows = samples.map(sample => {
     const requestTelemetry = classifyRequestTelemetry(sample.request);
+    const optimizationSegment = classifyOptimizationSegment(requestTelemetry);
     return {
       route_id: sample.request.route_id,
       input_hash: sample.request.input_hash || null,
@@ -74,6 +82,7 @@ export function runVerification(args = {}) {
       risk_tier: sample.request.risk_tier,
       connected_app_required: requestTelemetry.connected_app_required,
       memory_lookup_needed: requestTelemetry.memory_lookup_needed,
+      optimization_segment: optimizationSegment,
       acceptance_label: labels.get(sample.request.route_id) || null,
       missing_verification_fields: validateVerificationFields(sample),
     };
@@ -95,22 +104,31 @@ export function runVerification(args = {}) {
     writeJsonlRows(path.join(runDir, `baseline-routes.${baseline.name}.jsonl`), baselineRows);
   }
 
-  const metrics = evaluateRows({
+  let metrics = evaluateRows({
     routerRows: routerLog.rows,
     invalidRows: routerLog.invalid,
-    feedbackRows: feedback.rows,
+    feedbackRows,
     config,
   });
   metrics.verification = {
     run_id: manifest.run_id,
     samples: sampleRows.length,
     samples_sha256: samplesSha,
+    quality_labels_path: qualityLabels.path,
+    optimization_segments: sampleOptimizationSegments(sampleRows),
     telemetry_preconditions: {
       ok: missing.length === 0,
       missing,
     },
     exact_savings_available: false,
   };
+  const previousResultsPath = path.join(runDir, "execution-results.jsonl");
+  if (fs.existsSync(previousResultsPath)) {
+    metrics = updateMetricsWithExecution(metrics, readJsonl(previousResultsPath).rows, {
+      resultsPath: previousResultsPath,
+      samplesConsidered: sampleRows.length,
+    });
+  }
   writeJson(path.join(runDir, "metrics.json"), metrics);
   const updatedManifest = {
     ...manifest,
@@ -163,7 +181,14 @@ export async function executeVerificationRun(args = {}) {
 
   const metricsPath = path.join(runDir, "metrics.json");
   const metrics = readJson(metricsPath);
-  writeJson(metricsPath, updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConsidered: samples.length }));
+  writeJson(
+    metricsPath,
+    updateMetricsWithQualityLabels(
+      updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConsidered: samples.length }),
+      runDir,
+      qualityLabelsPath,
+    ),
+  );
   writeJson(manifestPath, {
     ...manifest,
     status: "executed",
@@ -230,6 +255,9 @@ export function reportVerificationRun(args = {}) {
     `Dispatcher overhead: ${metrics.dispatcher_overhead?.label ?? "baseline pending"}`,
     `Cost per accepted outcome: ${formatMaybeNumber(metrics.cost_per_accepted_outcome?.tokens)}`,
     `Estimated xhigh savings: ${metrics.savings?.label ?? "baseline pending"}`,
+    ``,
+    `Optimization segments:`,
+    ...formatOptimizationSegments(metrics.verification?.optimization_segments || metrics.optimization_segments),
     ``,
     `Weakest evidence: ${metrics.weakest_evidence || "baseline pending"}`,
     `Next test: ${metrics.next_test || "Run counterfactuals before exact savings claims."}`,
@@ -380,6 +408,12 @@ function baselinesForTicket(ticket = {}) {
 function writeJsonlRows(file, rows) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""));
+}
+
+function readQualityLabels(runDir) {
+  const labelsPath = path.join(runDir, "quality-labels.jsonl");
+  if (!fs.existsSync(labelsPath)) return { path: null, rows: [] };
+  return { path: labelsPath, rows: readJsonl(labelsPath).rows };
 }
 
 function readBaselineRouteFiles(runDir) {
@@ -734,6 +768,26 @@ async function writeQualityLabels({ runDir, rows, plan, config }) {
   return labelsPath;
 }
 
+function updateMetricsWithQualityLabels(metrics, runDir, qualityLabelsPath = null) {
+  const labelsPath = qualityLabelsPath || readQualityLabels(runDir).path;
+  if (!labelsPath) return metrics;
+  const samplesPath = path.join(runDir, "samples.jsonl");
+  if (!fs.existsSync(samplesPath)) return metrics;
+  const labelMap = feedbackLabelMap(readJsonl(labelsPath).rows);
+  const samples = readJsonl(samplesPath).rows.map(row => ({
+    ...row,
+    acceptance_label: labelMap.get(row.route_id) || row.acceptance_label || null,
+  }));
+  return {
+    ...metrics,
+    verification: {
+      ...(metrics.verification || {}),
+      quality_labels_path: labelsPath,
+      optimization_segments: sampleOptimizationSegments(samples),
+    },
+  };
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -881,4 +935,48 @@ function unique(values) {
 
 function formatMaybeNumber(value) {
   return Number.isFinite(value) ? value.toFixed(1) : "baseline pending";
+}
+
+function formatOptimizationSegments(segments = {}) {
+  const names = ["effort_sensitive", "capability_sensitive"];
+  return names.map(name => {
+    const segment = segments[name] || {};
+    return `- ${name}: count ${segment.count ?? 0}, underfit ${segment.underfit_rate ?? "baseline pending"}, rejection ${segment.rejection_rate ?? "baseline pending"}, acceptance ${segment.acceptance_rate ?? "baseline pending"}`;
+  });
+}
+
+function sampleOptimizationSegments(rows = []) {
+  const segments = Object.fromEntries(
+    OPTIMIZATION_SEGMENTS.map(segment => [
+      segment,
+      {
+        count: 0,
+        accepted: 0,
+        underfit: 0,
+        rejected: 0,
+        ambiguous: 0,
+        underfit_rate: "baseline pending",
+        rejection_rate: "baseline pending",
+        acceptance_rate: "baseline pending",
+      },
+    ]),
+  );
+
+  for (const row of rows) {
+    const segmentName = classifyOptimizationSegment(row);
+    const segment = segments[segmentName] || segments.effort_sensitive;
+    const label = row.acceptance_label;
+    segment.count += 1;
+    if (label === "accepted") segment.accepted += 1;
+    if (label === "underfit") segment.underfit += 1;
+    if (label === "rejected") segment.rejected += 1;
+    if (label === "ambiguous") segment.ambiguous += 1;
+  }
+
+  for (const segment of Object.values(segments)) {
+    segment.underfit_rate = percent(segment.underfit, segment.count);
+    segment.rejection_rate = percent(segment.rejected + segment.ambiguous, segment.count);
+    segment.acceptance_rate = percent(segment.accepted, segment.count);
+  }
+  return segments;
 }
