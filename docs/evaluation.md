@@ -114,6 +114,8 @@ The CLI should not claim exact savings without real counterfactual xhigh runs. W
 
 `peto verify` writes deterministic offline verification artifacts under `memory/verification/runs/<run_id>/`. V1 verification runs the candidate router and fixed baselines over logged samples only; it does not execute user requests or invoke RouteLLM unless a later explicit comparator ticket adds that behavior.
 
+Verification tickets may set `segment_filter` to `all`, `effort_sensitive`, or `capability_sensitive`. They may set `sample_mode` to `representative` or `stress`. Representative samples are seeded random samples from the selected segment and are claim-grade. Stress samples preserve the failure-biased underfit/rejected sampling behavior and are stress-grade for failure analysis.
+
 ## Agent-Orchestrated Verification
 
 V1 automated verification should run through `peto verify` first. The Symphony loop spec in [symphony-verification-loop.md](symphony-verification-loop.md) remains a design reference for a later agent wrapper, not a dependency of the PETO core harness.

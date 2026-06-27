@@ -23,6 +23,8 @@ const DEFAULT_GATES = {
 const EXECUTION_SAMPLE_LIMIT = 50;
 const RATE_LIMIT_ATTEMPTS = 3;
 const DEFAULT_EXECUTE_TIMEOUT_MS = 120_000;
+const SEGMENT_FILTERS = ["all", "effort_sensitive", "capability_sensitive"];
+const SAMPLE_MODES = ["representative", "stress"];
 
 export function createVerificationRun(args = {}) {
   const config = loadConfig(args);
@@ -40,6 +42,8 @@ export function createVerificationRun(args = {}) {
     created_at: new Date().toISOString(),
     ticket,
     seed: Number(ticket.seed ?? 1),
+    segment_filter: normalizeSegmentFilter(ticket.segment_filter),
+    sample_mode: normalizeSampleMode(ticket.sample_mode),
     samples_sha256: null,
     config_snapshot_sha256: sha256Text(stableJson(configSnapshot)),
     gates: { ...DEFAULT_GATES, ...(ticket.gates || {}) },
@@ -67,6 +71,8 @@ export function runVerification(args = {}) {
   const samples = curateSamples(routes, labels, {
     seed: manifest.seed,
     sampleSize: Number(manifest.ticket?.sample_size || 20),
+    segmentFilter: manifest.segment_filter,
+    sampleMode: manifest.sample_mode,
   });
   const sampleRows = samples.map(sample => {
     const requestTelemetry = classifyRequestTelemetry(sample.request);
@@ -114,6 +120,9 @@ export function runVerification(args = {}) {
     run_id: manifest.run_id,
     samples: sampleRows.length,
     samples_sha256: samplesSha,
+    segment_filter: manifest.segment_filter,
+    sample_mode: manifest.sample_mode,
+    sample_grade: sampleGrade(manifest.sample_mode),
     quality_labels_path: qualityLabels.path,
     optimization_segments: sampleOptimizationSegments(sampleRows),
     telemetry_preconditions: {
@@ -256,6 +265,10 @@ export function reportVerificationRun(args = {}) {
     `Cost per accepted outcome: ${formatMaybeNumber(metrics.cost_per_accepted_outcome?.tokens)}`,
     `Estimated xhigh savings: ${metrics.savings?.label ?? "baseline pending"}`,
     ``,
+    `Segment filter: ${metrics.verification?.segment_filter ?? manifest.segment_filter ?? "all"}`,
+    `Sample mode: ${metrics.verification?.sample_mode ?? manifest.sample_mode ?? "stress"}`,
+    `Sample grade: ${metrics.verification?.sample_grade ?? sampleGrade(metrics.verification?.sample_mode ?? manifest.sample_mode)}`,
+    ``,
     `Optimization segments:`,
     ...formatOptimizationSegments(metrics.verification?.optimization_segments || metrics.optimization_segments),
     ``,
@@ -352,6 +365,20 @@ function snapshotConfig(config) {
   return Object.fromEntries(Object.entries(config).filter(([key]) => !blocked.has(key)));
 }
 
+function normalizeSegmentFilter(value) {
+  const normalized = String(value || "all").trim();
+  return SEGMENT_FILTERS.includes(normalized) ? normalized : "all";
+}
+
+function normalizeSampleMode(value) {
+  const normalized = String(value || "stress").trim();
+  return SAMPLE_MODES.includes(normalized) ? normalized : "stress";
+}
+
+function sampleGrade(sampleMode) {
+  return normalizeSampleMode(sampleMode) === "representative" ? "claim-grade" : "stress-grade";
+}
+
 function resolveRunDir(config, runId) {
   if (!runId) throw new Error("verify command requires --id.");
   return path.join(config.verificationPath, "runs", runId);
@@ -367,18 +394,29 @@ function collectMissingVerificationFields(routes) {
   return found;
 }
 
-function curateSamples(routes, labels, { seed, sampleSize }) {
+function curateSamples(routes, labels, { seed, sampleSize, segmentFilter = "all", sampleMode = "stress" }) {
+  const eligibleRoutes = routes.filter(route => {
+    if (segmentFilter === "all") return true;
+    return route.request.optimization_segment === segmentFilter;
+  });
+  if (sampleMode === "representative") {
+    return seededRoutes(eligibleRoutes, seed).slice(0, sampleSize);
+  }
+
   const included = new Map();
-  for (const route of routes) {
+  for (const route of eligibleRoutes) {
     const label = labels.get(route.request.route_id);
     if (["underfit", "rejected"].includes(label)) included.set(route.request.route_id, route);
   }
-  const shuffled = [...routes].sort((a, b) => seededScore(a.request.route_id, seed) - seededScore(b.request.route_id, seed));
-  for (const route of shuffled) {
+  for (const route of seededRoutes(eligibleRoutes, seed)) {
     if (included.size >= sampleSize) break;
     included.set(route.request.route_id, route);
   }
   return [...included.values()];
+}
+
+function seededRoutes(routes, seed) {
+  return [...routes].sort((a, b) => seededScore(a.request.route_id, seed) - seededScore(b.request.route_id, seed));
 }
 
 function seededScore(value, seed) {

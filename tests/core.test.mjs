@@ -37,6 +37,29 @@ function closeServer(server) {
   return new Promise(resolve => server.close(resolve));
 }
 
+function appendVerificationPair(logPath, id, fields = {}) {
+  appendJsonl(logPath, {
+    id,
+    route_id: id,
+    schema_version: "1.0",
+    phase: "request",
+    router_usage: { total_tokens: 5 },
+    profile_segment: "default",
+    language: "en",
+    risk_tier: "low",
+    ...fields,
+  });
+  appendJsonl(logPath, {
+    id,
+    route_id: id,
+    schema_version: "1.0",
+    phase: "response",
+    status: "ok",
+    executor_usage: { total_tokens: 80 },
+    latency_ms: 100,
+  });
+}
+
 test("normalizeRouteEvent preserves legacy usage and adds verification fields", () => {
   const legacy = {
     id: "route-1",
@@ -723,6 +746,112 @@ test("verification run and report segment the current sample with existing quali
   assert.equal(samples.find(row => row.route_id === "capability-route").acceptance_label, "underfit");
   assert.match(reportText, /capability_sensitive: count 1, underfit 100.0%/);
   assert.match(reportText, /effort_sensitive: count 1, underfit 0.0%/);
+});
+
+test("verification representative sample filters effort-sensitive traffic without failure bias", () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  writeJson(configPath, {
+    memoryPath: root,
+    logPath,
+    feedbackPath,
+    allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+  });
+  writeJson(ticketPath, {
+    id: "peto-verify-effort-representative",
+    seed: 2,
+    sample_size: 2,
+    segment_filter: "effort_sensitive",
+    sample_mode: "representative",
+  });
+  appendVerificationPair(logPath, "effort-underfit", {
+    chosen_effort: "low",
+    request_class: "coding_help",
+    user_excerpt: "Debug the flaky test.",
+  });
+  appendVerificationPair(logPath, "effort-accepted-a", {
+    chosen_effort: "medium",
+    request_class: "coding_help",
+    user_excerpt: "Implement the CLI flag.",
+  });
+  appendVerificationPair(logPath, "effort-accepted-b", {
+    chosen_effort: "medium",
+    request_class: "coding_help",
+    user_excerpt: "Fix the parser bug.",
+  });
+  appendVerificationPair(logPath, "capability-underfit", {
+    chosen_effort: "medium",
+    request_class: "codex_suggestions",
+    connected_app_required: true,
+    user_excerpt: "Generate 0 to 3 hyperpersonalized suggestions by viewing connected apps.",
+  });
+  appendJsonl(feedbackPath, { route_id: "effort-underfit", acceptance_label: "underfit", signal: "quality_judge" });
+  appendJsonl(feedbackPath, { route_id: "capability-underfit", acceptance_label: "underfit", signal: "quality_judge" });
+
+  const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+  const run = runVerification({ config: configPath, id: created.run_id });
+  const report = reportVerificationRun({ config: configPath, id: created.run_id });
+  const samples = readJsonl(path.join(created.run_dir, "samples.jsonl")).rows;
+  const reportText = fs.readFileSync(report.report_path, "utf8");
+
+  assert.equal(run.metrics.verification.segment_filter, "effort_sensitive");
+  assert.equal(run.metrics.verification.sample_mode, "representative");
+  assert.equal(run.metrics.verification.sample_grade, "claim-grade");
+  assert.equal(samples.length, 2);
+  assert.equal(samples.every(row => row.optimization_segment === "effort_sensitive"), true);
+  assert.equal(samples.some(row => row.route_id === "capability-underfit"), false);
+  assert.deepEqual(samples.map(row => row.route_id), ["effort-accepted-b", "effort-accepted-a"]);
+  assert.match(reportText, /Segment filter: effort_sensitive/);
+  assert.match(reportText, /Sample mode: representative/);
+  assert.match(reportText, /Sample grade: claim-grade/);
+});
+
+test("verification stress sample preserves failure-biased sampling", () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  writeJson(configPath, {
+    memoryPath: root,
+    logPath,
+    feedbackPath,
+    allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+  });
+  writeJson(ticketPath, {
+    id: "peto-verify-effort-stress",
+    seed: 1,
+    sample_size: 1,
+    segment_filter: "effort_sensitive",
+    sample_mode: "stress",
+  });
+  appendVerificationPair(logPath, "effort-underfit", {
+    chosen_effort: "low",
+    request_class: "coding_help",
+    user_excerpt: "Debug the flaky test.",
+  });
+  appendVerificationPair(logPath, "effort-accepted", {
+    chosen_effort: "medium",
+    request_class: "coding_help",
+    user_excerpt: "Implement the CLI flag.",
+  });
+  appendJsonl(feedbackPath, { route_id: "effort-underfit", acceptance_label: "underfit", signal: "quality_judge" });
+
+  const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+  const run = runVerification({ config: configPath, id: created.run_id });
+  const report = reportVerificationRun({ config: configPath, id: created.run_id });
+  const samples = readJsonl(path.join(created.run_dir, "samples.jsonl")).rows;
+  const reportText = fs.readFileSync(report.report_path, "utf8");
+
+  assert.equal(run.metrics.verification.segment_filter, "effort_sensitive");
+  assert.equal(run.metrics.verification.sample_mode, "stress");
+  assert.equal(run.metrics.verification.sample_grade, "stress-grade");
+  assert.deepEqual(samples.map(row => row.route_id), ["effort-underfit"]);
+  assert.match(reportText, /Sample mode: stress/);
+  assert.match(reportText, /Sample grade: stress-grade/);
 });
 
 test("parseSseUsage returns usage from final data event and null for malformed streams", () => {
