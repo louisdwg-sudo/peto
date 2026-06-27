@@ -18,7 +18,7 @@ import {
   runVerification,
 } from "../packages/core/verify.mjs";
 import { writeFeedback } from "../packages/core/feedback.mjs";
-import { normalizeRouteEvent } from "../packages/core/telemetry.mjs";
+import { classifyRequestTelemetry, normalizeRouteEvent } from "../packages/core/telemetry.mjs";
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "peto-core-test-"));
@@ -53,6 +53,79 @@ test("normalizeRouteEvent preserves legacy usage and adds verification fields", 
   assert.deepEqual(normalized.usage, { total_tokens: 120 });
   assert.equal(normalized.retry_of, null);
   assert.deepEqual(normalized.annotations, []);
+});
+
+test("classifyRequestTelemetry derives compact request labels and prompt-shape flags", () => {
+  assert.deepEqual(
+    classifyRequestTelemetry({
+      user_excerpt: "Generate 0 to 3 hyperpersonalized suggestions of what this user can do with Codex, deeply viewing their connected apps.",
+    }),
+    {
+      request_class: "codex_suggestions",
+      connected_app_required: true,
+      memory_lookup_needed: false,
+    },
+  );
+
+  assert.deepEqual(
+    classifyRequestTelemetry({ user_excerpt: "Please restore my previous Codex session and continue from the last checkpoint." }),
+    {
+      request_class: "session_restore",
+      connected_app_required: false,
+      memory_lookup_needed: true,
+    },
+  );
+
+  assert.deepEqual(
+    classifyRequestTelemetry({ user_excerpt: "Analyze this rollout_summary jsonl and extract durable memory." }),
+    {
+      request_class: "memory_extraction",
+      connected_app_required: false,
+      memory_lookup_needed: true,
+    },
+  );
+
+  assert.deepEqual(classifyRequestTelemetry({ user_excerpt: "Debug the failing npm test in this repo." }), {
+    request_class: "coding_help",
+    connected_app_required: false,
+    memory_lookup_needed: false,
+  });
+
+  assert.deepEqual(
+    classifyRequestTelemetry({
+      user_excerpt: "You are a helpful assistant. Generate a concise UI title for this task. The tasks typically have to do with coding-related tasks.",
+    }),
+    {
+      request_class: "other",
+      connected_app_required: false,
+      memory_lookup_needed: false,
+    },
+  );
+
+  assert.deepEqual(classifyRequestTelemetry({ user_excerpt: "What should I eat for dinner?" }), {
+    request_class: "other",
+    connected_app_required: false,
+    memory_lookup_needed: false,
+  });
+});
+
+test("normalizeRouteEvent backfills request telemetry from excerpts", () => {
+  const normalized = normalizeRouteEvent({
+    id: "route-suggestions",
+    schema_version: "1.0",
+    phase: "request",
+    chosen_effort: "medium",
+    profile_segment: "default",
+    risk_tier: "low",
+    language: "en",
+    request_class: "unknown",
+    user_excerpt: "Generate 0 to 3 hyperpersonalized suggestions of what this user can do with Codex, deeply viewing their connected apps.",
+  });
+
+  assert.equal(normalized.request_class, "codex_suggestions");
+  assert.equal(normalized.connected_app_required, true);
+  assert.equal(normalized.memory_lookup_needed, false);
+  assert.deepEqual(normalized.verification_missing_fields, []);
 });
 
 test("evalLogs splits router and executor usage and honors explicit feedback labels", () => {
@@ -453,6 +526,56 @@ test("new-format verification logs block when required stratification fields are
   assert.deepEqual(run.missing_verification_fields, [{ route_id: "route-missing", field: "request_class" }]);
   assert.equal(gated.verdict.verdict, "blocked");
   assert.equal(gated.verdict.blocking_reason, "required verification telemetry fields are missing");
+});
+
+test("verification run backfills request class and prompt-shape telemetry into samples", () => {
+  const root = makeTempDir();
+  const logPath = path.join(root, "router-events.jsonl");
+  const feedbackPath = path.join(root, "feedback-signals.jsonl");
+  const configPath = path.join(root, "peto.config.json");
+  const ticketPath = path.join(root, "ticket.json");
+  writeJson(configPath, {
+    memoryPath: root,
+    logPath,
+    feedbackPath,
+    allowedEfforts: DEFAULT_CONFIG.allowedEfforts,
+  });
+  writeJson(ticketPath, {
+    id: "peto-verify-classification",
+    seed: 5,
+    sample_size: 1,
+  });
+  appendJsonl(logPath, {
+    id: "route-classify",
+    route_id: "route-classify",
+    schema_version: "1.0",
+    phase: "request",
+    chosen_effort: "medium",
+    router_usage: { total_tokens: 8 },
+    profile_segment: "default",
+    language: "en",
+    risk_tier: "low",
+    request_class: "unknown",
+    user_excerpt: "Generate 0 to 3 hyperpersonalized suggestions of what this user can do with Codex, deeply viewing their connected apps.",
+  });
+  appendJsonl(logPath, {
+    id: "route-classify",
+    route_id: "route-classify",
+    schema_version: "1.0",
+    phase: "response",
+    status: "ok",
+    executor_usage: { total_tokens: 80 },
+    latency_ms: 100,
+  });
+
+  const created = createVerificationRun({ config: configPath, ticket: ticketPath });
+  const run = runVerification({ config: configPath, id: created.run_id });
+  const samples = readJsonl(path.join(created.run_dir, "samples.jsonl")).rows;
+
+  assert.deepEqual(run.missing_verification_fields, []);
+  assert.equal(samples[0].request_class, "codex_suggestions");
+  assert.equal(samples[0].connected_app_required, true);
+  assert.equal(samples[0].memory_lookup_needed, false);
 });
 
 test("parseSseUsage returns usage from final data event and null for malformed streams", () => {

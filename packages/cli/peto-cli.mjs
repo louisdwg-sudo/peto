@@ -4,6 +4,7 @@ import { evalLogs, groupRoutes } from "../core/eval.mjs";
 import { writeFeedback } from "../core/feedback.mjs";
 import { hashText } from "../core/hash.mjs";
 import { appendJsonl, readJsonl } from "../core/jsonl.mjs";
+import { classifyRequestTelemetry } from "../core/telemetry.mjs";
 import {
   createVerificationRun,
   executeVerificationRun,
@@ -224,6 +225,10 @@ async function route(args) {
     schema_version: "1.0",
     annotations: [],
   };
+  const requestTelemetry = classifyRequestTelemetry({
+    request_class: args["request-class"],
+    user_excerpt: userText,
+  });
   const event = {
     ...common,
     phase: "request",
@@ -246,7 +251,9 @@ async function route(args) {
     profile_segment: args["profile-segment"] || "default",
     risk_tier: args["risk-tier"] || "unknown",
     language: args.language || "unknown",
-    request_class: args["request-class"] || "unknown",
+    request_class: requestTelemetry.request_class,
+    connected_app_required: requestTelemetry.connected_app_required,
+    memory_lookup_needed: requestTelemetry.memory_lookup_needed,
     acceptance_label: null,
     retrieved_notes: [],
     feedback_signal: false,

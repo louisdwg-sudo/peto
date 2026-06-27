@@ -6,7 +6,7 @@ import { evaluateRows, feedbackLabelMap, groupRoutes, sumUsageTokens } from "./e
 import { hashText, sha256Text, stableJson } from "./hash.mjs";
 import { judgeRoute } from "./judge.mjs";
 import { readJson, readJsonl, writeJson } from "./jsonl.mjs";
-import { validateVerificationFields } from "./telemetry.mjs";
+import { classifyRequestTelemetry, validateVerificationFields } from "./telemetry.mjs";
 
 const DEFAULT_GATES = {
   min_route_json_validity: 0.99,
@@ -61,18 +61,23 @@ export function runVerification(args = {}) {
     seed: manifest.seed,
     sampleSize: Number(manifest.ticket?.sample_size || 20),
   });
-  const sampleRows = samples.map(sample => ({
-    route_id: sample.request.route_id,
-    input_hash: sample.request.input_hash || null,
-    user_excerpt: sample.request.user_excerpt || null,
-    chosen_effort: sample.request.chosen_effort,
-    profile_segment: sample.request.profile_segment,
-    request_class: sample.request.request_class,
-    language: sample.request.language,
-    risk_tier: sample.request.risk_tier,
-    acceptance_label: labels.get(sample.request.route_id) || null,
-    missing_verification_fields: validateVerificationFields(sample),
-  }));
+  const sampleRows = samples.map(sample => {
+    const requestTelemetry = classifyRequestTelemetry(sample.request);
+    return {
+      route_id: sample.request.route_id,
+      input_hash: sample.request.input_hash || null,
+      user_excerpt: sample.request.user_excerpt || null,
+      chosen_effort: sample.request.chosen_effort,
+      profile_segment: sample.request.profile_segment,
+      request_class: requestTelemetry.request_class,
+      language: sample.request.language,
+      risk_tier: sample.request.risk_tier,
+      connected_app_required: requestTelemetry.connected_app_required,
+      memory_lookup_needed: requestTelemetry.memory_lookup_needed,
+      acceptance_label: labels.get(sample.request.route_id) || null,
+      missing_verification_fields: validateVerificationFields(sample),
+    };
+  });
   const sampleText = sampleRows.map(row => JSON.stringify(row)).join("\n") + (sampleRows.length ? "\n" : "");
   const samplesSha = sha256Text(sampleText);
   fs.writeFileSync(path.join(runDir, "samples.jsonl"), sampleText);
