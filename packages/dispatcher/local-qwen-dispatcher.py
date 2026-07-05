@@ -80,7 +80,7 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "ok": True,
-                    "model": "Qwen2.5-1.5B-Instruct",
+                    "model": os.path.basename(MODEL_DIR),
                     "model_dir": MODEL_DIR,
                     "device": DEVICE,
                     "uptime_sec": round(time.time() - STARTED_AT, 3),
@@ -148,7 +148,7 @@ def route_with_qwen(*, user_text: str, notes: list[Any], allowed: list[str]) -> 
         {"role": "user", "content": prompt},
     ]
 
-    rendered = TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    rendered = TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     inputs = TOKENIZER([rendered], return_tensors="pt").to(DEVICE)
     with TORCH.no_grad():
         generate_kwargs = {
