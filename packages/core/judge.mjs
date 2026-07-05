@@ -2,6 +2,10 @@ const DEFAULT_JUDGE_MODEL = "claude-haiku-4-5-20251001";
 const DEFAULT_JUDGE_EFFORT = "low";
 const JUDGE_LABELS = ["accepted", "underfit", "overfit", "rejected"];
 
+export function judgeModelForConfig(config = {}) {
+  return config.judgeModel || config.reviewModel || config.defaultTargetModel || DEFAULT_JUDGE_MODEL;
+}
+
 export async function judgeRoute({ userExcerpt, responseText, chosenEffort, config = {} }) {
   try {
     if (!config.upstreamBaseUrl) throw new Error("judge requires upstreamBaseUrl in config.");
@@ -26,18 +30,31 @@ export async function judgeRoute({ userExcerpt, responseText, chosenEffort, conf
 }
 
 async function callJudge({ userExcerpt, responseText, chosenEffort, config }) {
-  const response = await fetch(new URL("/v1/responses", config.upstreamBaseUrl), {
-    method: "POST",
-    headers: upstreamHeaders(config),
-    body: JSON.stringify({
-      model: config.judgeModel || DEFAULT_JUDGE_MODEL,
-      input: buildJudgePrompt({ userExcerpt, responseText, chosenEffort }),
-      reasoning: { effort: config.judgeEffort || DEFAULT_JUDGE_EFFORT },
-    }),
-  });
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`Judge call failed with ${response.status}: ${raw.slice(0, 500)}`);
-  return raw;
+  const timeoutMs = judgeTimeoutMs(config);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(new URL("/v1/responses", config.upstreamBaseUrl), {
+      method: "POST",
+      headers: upstreamHeaders(config),
+      body: JSON.stringify({
+        model: judgeModelForConfig(config),
+        input: buildJudgePrompt({ userExcerpt, responseText, chosenEffort }),
+        reasoning: { effort: config.judgeEffort || DEFAULT_JUDGE_EFFORT },
+      }),
+      signal: controller.signal,
+    });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`Judge call failed with ${response.status}: ${raw.slice(0, 500)}`);
+    return raw;
+  } catch (error) {
+    if (isTimeoutError(error)) {
+      throw new Error(`Judge request timed out after ${timeoutMs}ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function buildJudgePrompt({ userExcerpt, responseText, chosenEffort }) {
@@ -69,6 +86,15 @@ function upstreamHeaders(config) {
   return headers;
 }
 
+function judgeTimeoutMs(config) {
+  const timeout = Number(config.judgeTimeoutMs ?? config.verifyExecuteTimeoutMs);
+  return Number.isFinite(timeout) && timeout > 0 ? timeout : 120_000;
+}
+
+function isTimeoutError(error) {
+  return Boolean(error && (error.name === "AbortError" || /aborted|timed out/i.test(error.message || "")));
+}
+
 function parseJudgeVerdict(text) {
   const parsed = parseJson(text, "Judge returned unparseable JSON.");
   const label = String(parsed.label || "").toLowerCase();
@@ -80,11 +106,28 @@ function parseJudgeVerdict(text) {
 }
 
 function parseJson(text, message) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(message);
+  const candidates = [text, stripJsonFence(text), extractJsonObject(text)].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // Try the next increasingly forgiving JSON candidate.
+    }
   }
+  throw new Error(message);
+}
+
+function stripJsonFence(text) {
+  const match = String(text || "").trim().match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return match ? match[1].trim() : null;
+}
+
+function extractJsonObject(text) {
+  const value = String(text || "");
+  const start = value.indexOf("{");
+  const end = value.lastIndexOf("}");
+  if (start === -1 || end <= start) return null;
+  return value.slice(start, end + 1);
 }
 
 function extractResponseTextFromObject(parsed) {
