@@ -1,9 +1,11 @@
 {
   "name": "peto",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "Personalized Effort and Tokenomics Optimization research scaffold.",
+  "description": "Effort intelligence layer for AI agents — routes every request to the cheapest reasoning level that satisfies the user, with proof-grade evidence of savings.",
+  "engines": {
+    "node": ">=18"
+  },
   "bin": {
     "peto": "./packages/cli/peto-cli.mjs"
   },
