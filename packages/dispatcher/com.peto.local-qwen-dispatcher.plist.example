@@ -19,7 +19,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>QWEN_MODEL_DIR</key>
-    <string>/path/to/Qwen2.5-1.5B-Instruct</string>
+    <string>/path/to/Qwen3-1.7B</string>
     <key>PETO_QWEN_DTYPE</key>
     <string>float16</string>
   </dict>

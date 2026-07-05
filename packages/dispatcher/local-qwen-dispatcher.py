@@ -27,7 +27,7 @@ def main() -> int:
         "--model-dir",
         default=os.getenv(
             "QWEN_MODEL_DIR",
-            "/Users/louis/Documents/Project/第二题/Models/qwen/Qwen2.5-1.5B-Instruct",
+            "/Users/louis/Documents/Project/第二题/Models/qwen/Qwen3-1.7B",
         ),
     )
     args = parser.parse_args()
@@ -231,6 +231,82 @@ def qwen_label_route(effort: str, allowed: list[str]) -> dict[str, Any]:
     }
 
 
+SIMPLE_SESSION_LOOKUP_PATTERNS = [
+    r"\bwhere(?:'s| is) my (?:latest |last |current |previous )?(?:session|thread|chat)s?\b",
+    r"\bshow me my (?:threads|sessions|projects)\b",
+    r"\blist my (?:threads|sessions|projects)\b",
+]
+
+SESSION_ENTITY_TERMS = ["session", "sessions", "thread", "threads", "chat", "chats", "codex"]
+SESSION_RECOVERY_INTENT_TERMS = ["restore", "recover", "revive", "bring back", "hijacked"]
+SESSION_LOCAL_STATE_TERMS = [
+    ".codex",
+    "state_",
+    "sqlite",
+    "file tree",
+    "session list",
+    "local session",
+    "file identification",
+]
+SESSION_DIAGNOSTIC_TRIGGER_TERMS = [
+    "restore",
+    "recover",
+    "missing",
+    "broken",
+    "hijacked",
+    ".codex",
+    "state_",
+    "sqlite",
+    "file tree",
+    "session list",
+    "bring back",
+    "find my",
+    "where is my",
+    "where's my",
+]
+SESSION_HARD_DIAGNOSTIC_TERMS = [
+    "restore",
+    "recover",
+    "missing",
+    "broken",
+    "hijacked",
+    ".codex",
+    "state_",
+    "sqlite",
+    "file tree",
+    "session list",
+    "bring back",
+    "revive",
+]
+
+
+def is_simple_session_lookup(user_text: str) -> bool:
+    lowered = user_text.lower()
+    if not any(re.search(pattern, lowered) for pattern in SIMPLE_SESSION_LOOKUP_PATTERNS):
+        return False
+    return not any(term in lowered for term in SESSION_HARD_DIAGNOSTIC_TERMS)
+
+
+def should_floor_session_diagnostic_to_high(user_text: str) -> bool:
+    lowered = user_text.lower()
+    if is_simple_session_lookup(lowered):
+        return False
+
+    has_trigger = any(term in lowered for term in SESSION_DIAGNOSTIC_TRIGGER_TERMS)
+    if not has_trigger:
+        return False
+
+    has_session_entity = any(term in lowered for term in SESSION_ENTITY_TERMS)
+    has_recovery_intent = any(term in lowered for term in SESSION_RECOVERY_INTENT_TERMS)
+    has_local_state = any(term in lowered for term in SESSION_LOCAL_STATE_TERMS)
+    has_hard_diagnostic = any(term in lowered for term in SESSION_HARD_DIAGNOSTIC_TERMS)
+    has_diagnostic_intent = any(term in lowered for term in ["diagnos", "debug", "identify", "investigate"])
+
+    session_restore = has_session_entity and (has_recovery_intent or has_hard_diagnostic)
+    local_state_diagnostic = has_local_state and (has_recovery_intent or has_hard_diagnostic or has_diagnostic_intent)
+    return session_restore or local_state_diagnostic
+
+
 def calibrate_effort(effort: str, user_text: str, allowed: list[str]) -> str:
     heuristic = heuristic_route(user_text, allowed)["target_effort"]
     if effort not in allowed:
@@ -252,6 +328,9 @@ def calibrate_effort(effort: str, user_text: str, allowed: list[str]) -> str:
         "redo",
     ]
     lowered = user_text.lower()
+    if should_floor_session_diagnostic_to_high(user_text) and order[effort] < order.get("high", 3):
+        return "high" if "high" in allowed else heuristic
+
     if any(term in lowered for term in obvious_high_terms) and order[effort] < order.get("high", 3):
         return "high" if "high" in allowed else heuristic
 
@@ -325,11 +404,12 @@ def heuristic_route(user_text: str, allowed: list[str]) -> dict[str, Any]:
     dissatisfaction = any(token in text for token in ["not right", "redo", "trash", "rubbish", "you missed", "不对", "重来"])
     research = any(token in text for token in ["research", "paper", "article", "evaluation", "methodology", "critical analysis"])
     code_work = any(token in text for token in ["fix", "debug", "implement", "commit", "deploy", "dispatcher", "router", "gateway"])
+    session_diagnostic_high_floor = should_floor_session_diagnostic_to_high(user_text)
     simple = word_count <= 18 and not any([research, code_work, explicit_high, explicit_xhigh, dissatisfaction])
 
     if explicit_xhigh:
         effort = "xhigh"
-    elif explicit_high or dissatisfaction:
+    elif explicit_high or dissatisfaction or session_diagnostic_high_floor:
         effort = "high"
     elif research:
         effort = "high" if word_count > 40 else "medium"
@@ -346,7 +426,11 @@ def heuristic_route(user_text: str, allowed: list[str]) -> dict[str, Any]:
     return {
         "target_effort": effort,
         "confidence": 0.48,
-        "rationale_short": f"Heuristic route: {effort} matched request shape.",
+        "rationale_short": (
+            "Heuristic route: high matched session/local-state diagnostic."
+            if session_diagnostic_high_floor and effort == "high"
+            else f"Heuristic route: {effort} matched request shape."
+        ),
         "recording_priority": "watch" if effort in {"high", "xhigh"} or dissatisfaction else "normal",
         "needs_review": dissatisfaction,
         "source": "heuristic",
