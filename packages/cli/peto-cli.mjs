@@ -4,6 +4,7 @@ import { evalLogs, groupRoutes } from "../core/eval.mjs";
 import { writeFeedback } from "../core/feedback.mjs";
 import { hashText } from "../core/hash.mjs";
 import { appendJsonl, readJsonl } from "../core/jsonl.mjs";
+import { classifyRequestTelemetry } from "../core/telemetry.mjs";
 import {
   createVerificationRun,
   executeVerificationRun,
@@ -20,6 +21,7 @@ Usage:
   peto route "user request" [--config FILE] [--json] [--no-log]
   peto feedback --route-id ID --label accepted|underfit|overfit|rejected|ambiguous|invalid [--notes TEXT]
   peto eval [--config FILE] [--log FILE] [--feedback FILE] [--json]
+    # quality-labels.jsonl from verify execute can be passed directly as --feedback
   peto replay [--config FILE] [--log FILE] [--limit N] [--json]
   peto verify create --ticket FILE [--config FILE] [--json]
   peto verify run --id RUN_ID [--config FILE] [--json]
@@ -138,7 +140,10 @@ function formatHuman(data) {
       `planned calls: ${data.planned}`,
       `executed rows: ${data.executed}`,
       `errors: ${data.errors}`,
+      `errors by type: ${formatErrorsByType(data.errors_by_type)}`,
+      `distinct errors: ${formatDistinctErrors(data.distinct_errors)}`,
       data.results_path,
+      data.quality_labels_path || "quality labels: skipped",
     ].join("\n");
   }
   if (data.kind === "verify_gate") return `verify verdict: ${data.verdict.verdict}`;
@@ -220,6 +225,10 @@ async function route(args) {
     schema_version: "1.0",
     annotations: [],
   };
+  const requestTelemetry = classifyRequestTelemetry({
+    request_class: args["request-class"],
+    user_excerpt: userText,
+  });
   const event = {
     ...common,
     phase: "request",
@@ -242,7 +251,9 @@ async function route(args) {
     profile_segment: args["profile-segment"] || "default",
     risk_tier: args["risk-tier"] || "unknown",
     language: args.language || "unknown",
-    request_class: args["request-class"] || "unknown",
+    request_class: requestTelemetry.request_class,
+    connected_app_required: requestTelemetry.connected_app_required,
+    memory_lookup_needed: requestTelemetry.memory_lookup_needed,
     acceptance_label: null,
     retrieved_notes: [],
     feedback_signal: false,
@@ -341,6 +352,15 @@ async function main() {
 
 function formatMaybeNumber(value) {
   return Number.isFinite(value) ? value.toFixed(1) : "baseline pending";
+}
+
+function formatErrorsByType(errorsByType = {}) {
+  const entries = Object.entries(errorsByType);
+  return entries.length ? entries.map(([type, count]) => `${type}=${count}`).join(", ") : "none";
+}
+
+function formatDistinctErrors(errors = []) {
+  return errors.length ? errors.join(" | ") : "none";
 }
 
 main().catch(error => {

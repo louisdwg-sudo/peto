@@ -62,7 +62,7 @@ This gateway is effort-only by default. It does not switch executor models, call
 
 The gateway logs route events using PETO verification schema `1.0`.
 
-- request events include `route_id`, `profile_segment`, `risk_tier`, `language`, `request_class`, `router_usage`, `executor_usage: null`, `acceptance_label`, and `annotations`
+- request events include `route_id`, `profile_segment`, `risk_tier`, `language`, `request_class`, `connected_app_required`, `memory_lookup_needed`, `router_usage`, `executor_usage: null`, `acceptance_label`, and `annotations`
 - response events include the same `route_id`, `executor_usage`, and a backward-compatible `usage` alias
 - router usage and executor usage stay separate so the CLI can compute dispatcher overhead and cost per accepted outcome
 

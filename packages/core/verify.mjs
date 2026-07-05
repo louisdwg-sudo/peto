@@ -2,10 +2,16 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { EFFORTS, loadConfig } from "./config.mjs";
-import { evaluateRows, feedbackLabelMap, groupRoutes, sumUsageTokens } from "./eval.mjs";
+import { evaluateRows, feedbackLabelMap, groupRoutes, percent, sumUsageTokens } from "./eval.mjs";
 import { hashText, sha256Text, stableJson } from "./hash.mjs";
+import { judgeModelForConfig, judgeRoute } from "./judge.mjs";
 import { readJson, readJsonl, writeJson } from "./jsonl.mjs";
-import { validateVerificationFields } from "./telemetry.mjs";
+import {
+  OPTIMIZATION_SEGMENTS,
+  classifyOptimizationSegment,
+  classifyRequestTelemetry,
+  validateVerificationFields,
+} from "./telemetry.mjs";
 
 const DEFAULT_GATES = {
   min_route_json_validity: 0.99,
@@ -16,6 +22,9 @@ const DEFAULT_GATES = {
 
 const EXECUTION_SAMPLE_LIMIT = 50;
 const RATE_LIMIT_ATTEMPTS = 3;
+const DEFAULT_EXECUTE_TIMEOUT_MS = 120_000;
+const SEGMENT_FILTERS = ["all", ...OPTIMIZATION_SEGMENTS];
+const SAMPLE_MODES = ["representative", "stress"];
 
 export function createVerificationRun(args = {}) {
   const config = loadConfig(args);
@@ -33,6 +42,8 @@ export function createVerificationRun(args = {}) {
     created_at: new Date().toISOString(),
     ticket,
     seed: Number(ticket.seed ?? 1),
+    segment_filter: normalizeSegmentFilter(ticket.segment_filter),
+    sample_mode: normalizeSampleMode(ticket.sample_mode),
     samples_sha256: null,
     config_snapshot_sha256: sha256Text(stableJson(configSnapshot)),
     gates: { ...DEFAULT_GATES, ...(ticket.gates || {}) },
@@ -52,25 +63,40 @@ export function runVerification(args = {}) {
 
   const routerLog = readJsonl(config.logPath);
   const feedback = readJsonl(config.feedbackPath);
+  const qualityLabels = readQualityLabels(runDir);
+  const feedbackRows = [...feedback.rows, ...qualityLabels.rows];
   const routes = groupRoutes(routerLog.rows);
   const missing = collectMissingVerificationFields(routes);
-  const labels = feedbackLabelMap(feedback.rows);
+  const labels = feedbackLabelMap(feedbackRows);
   const samples = curateSamples(routes, labels, {
     seed: manifest.seed,
     sampleSize: Number(manifest.ticket?.sample_size || 20),
+    segmentFilter: manifest.segment_filter,
+    sampleMode: manifest.sample_mode,
   });
-  const sampleRows = samples.map(sample => ({
-    route_id: sample.request.route_id,
-    input_hash: sample.request.input_hash || null,
-    user_excerpt: sample.request.user_excerpt || null,
-    chosen_effort: sample.request.chosen_effort,
-    profile_segment: sample.request.profile_segment,
-    request_class: sample.request.request_class,
-    language: sample.request.language,
-    risk_tier: sample.request.risk_tier,
-    acceptance_label: labels.get(sample.request.route_id) || null,
-    missing_verification_fields: validateVerificationFields(sample),
-  }));
+  const sampleRows = samples.map(sample => {
+    const requestTelemetry = classifyRequestTelemetry(sample.request);
+    const optimizationSegment = classifyOptimizationSegment(requestTelemetry);
+    return {
+      route_id: sample.request.route_id,
+      input_hash: sample.request.input_hash || null,
+      user_excerpt: sample.request.user_excerpt || null,
+      chosen_effort: sample.request.chosen_effort,
+      profile_segment: sample.request.profile_segment,
+      request_class: requestTelemetry.request_class,
+      language: sample.request.language,
+      risk_tier: sample.request.risk_tier,
+      connected_app_required: requestTelemetry.connected_app_required,
+      memory_lookup_needed: requestTelemetry.memory_lookup_needed,
+      tool_execution_required: requestTelemetry.tool_execution_required,
+      workspace_action_required: requestTelemetry.workspace_action_required,
+      action_or_recovery_required: requestTelemetry.action_or_recovery_required,
+      local_artifact_required: requestTelemetry.local_artifact_required,
+      optimization_segment: optimizationSegment,
+      acceptance_label: labels.get(sample.request.route_id) || null,
+      missing_verification_fields: validateVerificationFields(sample),
+    };
+  });
   const sampleText = sampleRows.map(row => JSON.stringify(row)).join("\n") + (sampleRows.length ? "\n" : "");
   const samplesSha = sha256Text(sampleText);
   fs.writeFileSync(path.join(runDir, "samples.jsonl"), sampleText);
@@ -83,27 +109,46 @@ export function runVerification(args = {}) {
 
   const candidateRows = samples.map(sample => routeResultFromSample(sample, "candidate", sample.request.chosen_effort));
   writeJsonlRows(path.join(runDir, "candidate-routes.jsonl"), candidateRows);
+  const baselineSets = [];
   for (const baseline of baselinesForTicket(manifest.ticket)) {
     const baselineRows = samples.map(sample => routeResultFromSample(sample, baseline.name, baseline.effort));
+    baselineSets.push({ name: baseline.name, rows: baselineRows });
     writeJsonlRows(path.join(runDir, `baseline-routes.${baseline.name}.jsonl`), baselineRows);
   }
 
-  const metrics = evaluateRows({
+  let metrics = evaluateRows({
     routerRows: routerLog.rows,
     invalidRows: routerLog.invalid,
-    feedbackRows: feedback.rows,
+    feedbackRows,
     config,
   });
   metrics.verification = {
     run_id: manifest.run_id,
     samples: sampleRows.length,
     samples_sha256: samplesSha,
+    segment_filter: manifest.segment_filter,
+    sample_mode: manifest.sample_mode,
+    sample_grade: sampleGrade(manifest.sample_mode),
+    quality_labels_path: qualityLabels.path,
+    optimization_segments: sampleOptimizationSegments(sampleRows),
     telemetry_preconditions: {
       ok: missing.length === 0,
       missing,
     },
     exact_savings_available: false,
   };
+  const previousResultsPath = path.join(runDir, "execution-results.jsonl");
+  if (fs.existsSync(previousResultsPath)) {
+    const currentPlan = buildExecutionPlan({ samples: sampleRows, candidateRows, baselineSets, routerRows: routerLog.rows });
+    const reusableRows = readReusableExecutionRows(previousResultsPath, currentPlan);
+    if (reusableRows) {
+      metrics = updateMetricsWithExecution(metrics, reusableRows, {
+        resultsPath: previousResultsPath,
+        samplesConsidered: sampleRows.length,
+        plan: currentPlan,
+      });
+    }
+  }
   writeJson(path.join(runDir, "metrics.json"), metrics);
   const updatedManifest = {
     ...manifest,
@@ -146,26 +191,65 @@ export async function executeVerificationRun(args = {}) {
 
   if (dryRun) return { ...base, plan };
 
-  const rows = [];
-  for (const item of plan) rows.push(await executePlanItem({ item, config }));
   const resultsPath = path.join(runDir, "execution-results.jsonl");
-  writeJsonlRows(resultsPath, rows);
+  preflightExecuteConfig(config);
+  const resumePlan = planExecutionResume({ resultsPath, plan });
+  const reusedExecutionResults = resumePlan.itemsToExecute.length === 0 && resumePlan.rows.length > 0;
+  const resumedExecutionRows = resumePlan.itemsToExecute.map(item => ({
+    route_id: item.route_id,
+    source: item.source,
+    effort: item.effort,
+  }));
+  let rows = resumePlan.rows;
+  if (resumePlan.itemsToExecute.length) {
+    writeJsonlRows(resultsPath, rows);
+    await executeResumeGroups({
+      groups: resumePlan.groupsToExecute,
+      config,
+      onRow: row => {
+        resumePlan.rowMap.set(planItemKey(row), row);
+        rows = orderedRowsFromMap(resumePlan.rowMap, plan);
+        writeJsonlRows(resultsPath, rows);
+      },
+    });
+    rows = orderedRowsFromMap(resumePlan.rowMap, plan);
+  } else if (!fs.existsSync(resultsPath)) {
+    writeJsonlRows(resultsPath, rows);
+  }
+  const qualityLabelsPath =
+    config.enableQualityJudge === false ? null : await writeQualityLabels({ runDir, rows, plan, config });
 
   const metricsPath = path.join(runDir, "metrics.json");
   const metrics = readJson(metricsPath);
-  writeJson(metricsPath, updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConsidered: samples.length }));
+  writeJson(
+    metricsPath,
+    updateMetricsWithQualityLabels(
+      updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConsidered: samples.length, plan }),
+      runDir,
+      qualityLabelsPath,
+    ),
+  );
   writeJson(manifestPath, {
     ...manifest,
     status: "executed",
-    annotations: unique([...(manifest.annotations || []), "counterfactual_executed"]),
+    annotations: unique([
+      ...(manifest.annotations || []),
+      "counterfactual_executed",
+      qualityLabelsPath ? "quality_judge_complete" : null,
+    ]),
   });
 
   return {
     ...base,
     dry_run: false,
     executed: rows.length,
+    reused_execution_results: reusedExecutionResults,
+    resumed_execution_rows: resumedExecutionRows,
+    skipped_execution_rows: Math.max(0, plan.length - resumedExecutionRows.length),
     errors: rows.filter(row => row.error).length,
+    ...executionErrorSummary(rows),
     results_path: resultsPath,
+    quality_labels_path: qualityLabelsPath,
   };
 }
 
@@ -175,7 +259,8 @@ export function gateVerificationRun(args = {}) {
   const manifest = readJson(path.join(runDir, "run-manifest.json"));
   const metrics = readJson(path.join(runDir, "metrics.json"));
   if (!metrics.kind) throw new Error(`Missing metrics.json for ${args.id}. Run verify run first.`);
-  const gates = computeGates({ manifest, metrics, config });
+  const evidence = evidenceSummary({ runDir, manifest, metrics, config });
+  const gates = computeGates({ manifest, metrics, config, evidence });
   const hardFailures = gates.filter(gate => gate.severity === "hard" && !gate.pass);
   const softFailures = gates.filter(gate => gate.severity === "soft" && !gate.pass);
   const humanReviewGate = gates.find(gate => gate.name === "human_review_queue_clear");
@@ -183,6 +268,13 @@ export function gateVerificationRun(args = {}) {
   const verdict = {
     run_id: manifest.run_id,
     verdict: verdictValue,
+    evidence_status: evidence.evidence_status,
+    sample_status: evidence.sample_status,
+    claim_status: evidence.claim_status,
+    execution_pairing: evidence.execution_pairing,
+    execution_pairing_ratio: evidence.execution_pairing_ratio,
+    evidence_missing: evidence.missing,
+    evidence_reason: evidence.reason,
     gates_passed: gates.filter(gate => gate.pass).map(gate => gate.name),
     gates_failed: gates.filter(gate => !gate.pass).map(gate => gate.name),
     blocking_reason: unique(hardFailures.map(gate => gate.reason).filter(Boolean)).join("; ") || null,
@@ -203,17 +295,40 @@ export function reportVerificationRun(args = {}) {
   const metrics = readJson(path.join(runDir, "metrics.json"));
   let verdict = readJson(path.join(runDir, "verdict.json"), null);
   if (!verdict) verdict = gateVerificationRun(args).verdict;
+  const pairingLine = executionPairingReportLine(metrics);
+  const pairingStatusLine = `Execution pairing status: ${metrics.execution?.execution_pairing ?? verdict.execution_pairing ?? "unknown"}`;
+  const contaminatedPairingLines =
+    (metrics.execution?.execution_pairing ?? verdict.execution_pairing) === "contaminated"
+      ? ["Execution pairing is contaminated; savings are matched-pair-only and the claim is not proven."]
+      : [];
   const report = [
     `# PETO Verification Report`,
     ``,
     `Run: ${manifest.run_id}`,
+    pairingLine,
+    pairingStatusLine,
+    ...contaminatedPairingLines,
     `Verdict: ${verdict.verdict}`,
+    `Evidence status: ${verdict.evidence_status ?? "unknown"}`,
+    `Sample status: ${verdict.sample_status ?? "unknown"}`,
+    `Claim status: ${verdict.claim_status ?? "unknown"}`,
+    `Reason: ${verdict.evidence_reason || "none"}`,
     `Samples: ${metrics.verification?.samples ?? 0}`,
     `Route JSON validity: ${metrics.routes?.validity_percent ?? "baseline pending"}`,
     `Underfit rate: ${metrics.outcomes?.underfit_rate ?? "baseline pending"}`,
     `Dispatcher overhead: ${metrics.dispatcher_overhead?.label ?? "baseline pending"}`,
     `Cost per accepted outcome: ${formatMaybeNumber(metrics.cost_per_accepted_outcome?.tokens)}`,
     `Estimated xhigh savings: ${metrics.savings?.label ?? "baseline pending"}`,
+    `Savings basis: ${savingsBasisLabel(metrics)}`,
+    ``,
+    `Segment filter: ${metrics.verification?.segment_filter ?? manifest.segment_filter ?? "all"}`,
+    `Sample mode: ${metrics.verification?.sample_mode ?? manifest.sample_mode ?? "stress"}`,
+    `Sample grade: ${metrics.verification?.sample_grade ?? sampleGrade(metrics.verification?.sample_mode ?? manifest.sample_mode)}`,
+    `Quality labels: ${formatQualityLabelSummary(metrics.verification?.quality_labels)}`,
+    ...formatAmbiguousReasons(metrics.verification?.quality_labels),
+    ``,
+    `Optimization segments:`,
+    ...formatOptimizationSegments(metrics.verification?.optimization_segments || metrics.optimization_segments),
     ``,
     `Weakest evidence: ${metrics.weakest_evidence || "baseline pending"}`,
     `Next test: ${metrics.next_test || "Run counterfactuals before exact savings claims."}`,
@@ -308,6 +423,20 @@ function snapshotConfig(config) {
   return Object.fromEntries(Object.entries(config).filter(([key]) => !blocked.has(key)));
 }
 
+function normalizeSegmentFilter(value) {
+  const normalized = String(value || "all").trim();
+  return SEGMENT_FILTERS.includes(normalized) ? normalized : "all";
+}
+
+function normalizeSampleMode(value) {
+  const normalized = String(value || "stress").trim();
+  return SAMPLE_MODES.includes(normalized) ? normalized : "stress";
+}
+
+function sampleGrade(sampleMode) {
+  return normalizeSampleMode(sampleMode) === "representative" ? "claim-grade" : "stress-grade";
+}
+
 function resolveRunDir(config, runId) {
   if (!runId) throw new Error("verify command requires --id.");
   return path.join(config.verificationPath, "runs", runId);
@@ -323,18 +452,29 @@ function collectMissingVerificationFields(routes) {
   return found;
 }
 
-function curateSamples(routes, labels, { seed, sampleSize }) {
+function curateSamples(routes, labels, { seed, sampleSize, segmentFilter = "all", sampleMode = "stress" }) {
+  const eligibleRoutes = routes.filter(route => {
+    if (segmentFilter === "all") return true;
+    return route.request.optimization_segment === segmentFilter;
+  });
+  if (sampleMode === "representative") {
+    return seededRoutes(eligibleRoutes, seed).slice(0, sampleSize);
+  }
+
   const included = new Map();
-  for (const route of routes) {
+  for (const route of eligibleRoutes) {
     const label = labels.get(route.request.route_id);
     if (["underfit", "rejected"].includes(label)) included.set(route.request.route_id, route);
   }
-  const shuffled = [...routes].sort((a, b) => seededScore(a.request.route_id, seed) - seededScore(b.request.route_id, seed));
-  for (const route of shuffled) {
+  for (const route of seededRoutes(eligibleRoutes, seed)) {
     if (included.size >= sampleSize) break;
     included.set(route.request.route_id, route);
   }
   return [...included.values()];
+}
+
+function seededRoutes(routes, seed) {
+  return [...routes].sort((a, b) => seededScore(a.request.route_id, seed) - seededScore(b.request.route_id, seed));
 }
 
 function seededScore(value, seed) {
@@ -364,6 +504,116 @@ function baselinesForTicket(ticket = {}) {
 function writeJsonlRows(file, rows) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""));
+}
+
+function appendJsonlRow(file, row) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${JSON.stringify(row)}\n`);
+}
+
+function readReusableExecutionRows(resultsPath, plan) {
+  if (!fs.existsSync(resultsPath)) return null;
+  const parsed = readJsonl(resultsPath);
+  if (parsed.invalid || parsed.rows.length !== plan.length) return null;
+  for (let index = 0; index < plan.length; index += 1) {
+    const row = parsed.rows[index];
+    const item = plan[index];
+    if (row.route_id !== item.route_id || row.source !== item.source || row.effort !== item.effort) return null;
+  }
+  return parsed.rows;
+}
+
+function planExecutionResume({ resultsPath, plan }) {
+  const rowMap = readExecutionRowMap(resultsPath, plan);
+  const groupsToExecute = [];
+  const seenExecuteKeys = new Set();
+
+  for (const group of executionRouteGroups(plan)) {
+    const candidateRow = rowMap.get(planItemKey(group.candidate));
+    const candidateSuccess = isMatchedExecutionSuccess(candidateRow);
+    const groupItems = [];
+    for (const baseline of group.baselines) {
+      const baselineRow = rowMap.get(planItemKey(baseline));
+      const baselineSuccess = isMatchedExecutionSuccess(baselineRow);
+      if (candidateSuccess && baselineSuccess) continue;
+      if (!candidateSuccess) addResumeItem(groupItems, seenExecuteKeys, group.candidate);
+      if (!baselineSuccess) addResumeItem(groupItems, seenExecuteKeys, baseline);
+    }
+    if (groupItems.length) groupsToExecute.push({ route_id: group.route_id, items: groupItems });
+  }
+
+  return {
+    rowMap,
+    rows: orderedRowsFromMap(rowMap, plan),
+    groupsToExecute,
+    itemsToExecute: groupsToExecute.flatMap(group => group.items),
+  };
+}
+
+function addResumeItem(items, seen, item) {
+  const key = planItemKey(item);
+  if (seen.has(key)) return;
+  seen.add(key);
+  items.push(item);
+}
+
+function readExecutionRowMap(resultsPath, plan) {
+  const planKeys = new Set(plan.map(planItemKey));
+  const rowMap = new Map();
+  if (!fs.existsSync(resultsPath)) return rowMap;
+  const parsed = readJsonl(resultsPath);
+  if (parsed.invalid) return rowMap;
+  for (const row of parsed.rows) {
+    const key = planItemKey(row);
+    if (planKeys.has(key)) rowMap.set(key, row);
+  }
+  return rowMap;
+}
+
+function orderedRowsFromMap(rowMap, plan) {
+  return plan.map(item => rowMap.get(planItemKey(item))).filter(Boolean);
+}
+
+function executionRouteGroups(plan) {
+  const groups = new Map();
+  for (const item of plan) {
+    const group = groups.get(item.route_id) || { route_id: item.route_id, candidate: null, baselines: [] };
+    if (item.source === "candidate") group.candidate = item;
+    if (item.source.startsWith("baseline_")) group.baselines.push(item);
+    groups.set(item.route_id, group);
+  }
+  return [...groups.values()].filter(group => group.candidate && group.baselines.length);
+}
+
+function planItemKey(item) {
+  return `${item.route_id}:${item.source}:${item.effort}`;
+}
+
+async function executeResumeGroups({ groups, config, onRow }) {
+  const concurrency = Math.min(executionConcurrency(config), groups.length || 1);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < groups.length) {
+      const group = groups[nextIndex];
+      nextIndex += 1;
+      for (const item of group.items) {
+        onRow(await executePlanItem({ item, config }));
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+}
+
+function executionConcurrency(config) {
+  const configured = Number(config.verifyExecuteConcurrency);
+  if (Number.isFinite(configured) && configured > 0) return Math.min(4, Math.max(2, Math.floor(configured)));
+  return 3;
+}
+
+function readQualityLabels(runDir) {
+  const labelsPath = path.join(runDir, "quality-labels.jsonl");
+  if (!fs.existsSync(labelsPath)) return { path: null, rows: [] };
+  return { path: labelsPath, rows: readJsonl(labelsPath).rows };
 }
 
 function readBaselineRouteFiles(runDir) {
@@ -422,23 +672,41 @@ async function executePlanItem({ item, config }) {
   const started = Date.now();
   if (!item.user_excerpt) {
     return executionRow(item, {
+      model: config.defaultTargetModel || null,
+      upstream_url: safeUpstreamResponsesUrl(config),
+      status_code: null,
+      attempts: 0,
       executor_usage: null,
+      response_text: null,
       latency_ms: null,
+      error_type: "missing_user_excerpt",
       error: "missing user_excerpt",
     });
   }
 
   try {
-    const executor_usage = await callUpstreamExecutor({ item, config });
+    const result = await callUpstreamExecutor({ item, config });
     return executionRow(item, {
-      executor_usage,
+      model: result.model,
+      upstream_url: result.upstream_url,
+      status_code: result.status_code,
+      attempts: result.attempts,
+      executor_usage: result.executor_usage,
+      response_text: item.source === "candidate" ? result.response_text : null,
       latency_ms: Date.now() - started,
+      error_type: null,
       error: null,
     });
   } catch (error) {
     return executionRow(item, {
+      model: error.model || config.defaultTargetModel || null,
+      upstream_url: error.upstream_url || safeUpstreamResponsesUrl(config),
+      status_code: error.status_code ?? null,
+      attempts: error.attempts ?? 0,
       executor_usage: null,
+      response_text: null,
       latency_ms: Date.now() - started,
+      error_type: error.error_type || classifyExecutionError(error),
       error: error.message,
     });
   }
@@ -447,41 +715,94 @@ async function executePlanItem({ item, config }) {
 function executionRow(item, fields) {
   return {
     route_id: item.route_id,
-    effort: item.effort,
     source: item.source,
+    effort: item.effort,
+    model: fields.model ?? null,
+    upstream_url: fields.upstream_url ?? null,
+    status_code: fields.status_code ?? null,
+    attempts: fields.attempts ?? 0,
     executor_usage: fields.executor_usage,
+    response_text: fields.response_text ?? null,
     latency_ms: fields.latency_ms,
+    error_type: fields.error_type ?? null,
     error: fields.error,
   };
 }
 
 async function callUpstreamExecutor({ item, config }) {
-  if (!config.upstreamBaseUrl) throw new Error("verify execute requires upstreamBaseUrl in config.");
-  if (!config.defaultTargetModel) throw new Error("verify execute requires defaultTargetModel in config.");
+  const upstream_url = upstreamResponsesUrl(config).toString();
+  const model = config.defaultTargetModel;
 
   let lastError = null;
   for (let attempt = 1; attempt <= RATE_LIMIT_ATTEMPTS; attempt += 1) {
     try {
-      const response = await fetch(upstreamResponsesUrl(config), {
+      const response = await fetchWithTimeout(upstream_url, {
         method: "POST",
         headers: upstreamHeaders(config),
         body: JSON.stringify({
-          model: config.defaultTargetModel,
+          model,
           input: item.user_excerpt,
           reasoning: { effort: item.effort },
         }),
-      });
+      }, executionTimeoutMs(config));
       const raw = await response.text();
       if (response.status === 429 && attempt < RATE_LIMIT_ATTEMPTS) {
         await sleep((config.verifyExecuteRetryBaseMs || 250) * 2 ** (attempt - 1));
         continue;
       }
-      if (!response.ok) throw new Error(`Upstream ${response.status}: ${raw.slice(0, 500)}`);
-      return extractUsage(raw);
+      if (isRetryableUpstreamStatus(response.status) && attempt < RATE_LIMIT_ATTEMPTS) {
+        await sleep((config.verifyExecuteRetryBaseMs || 250) * 2 ** (attempt - 1));
+        continue;
+      }
+      if (!response.ok) {
+        throw executionError({
+          message: `Upstream ${response.status} ${httpStatusDiagnostic(response.status)}: ${raw.slice(0, 500)}`,
+          model,
+          upstream_url,
+          status_code: response.status,
+          attempts: attempt,
+          error_type: String(response.status),
+        });
+      }
+      let executor_usage = null;
+      let response_text = null;
+      try {
+        executor_usage = extractUsage(raw);
+        response_text = extractResponseText(raw);
+      } catch (error) {
+        throw executionError({
+          message: error.message,
+          model,
+          upstream_url,
+          status_code: response.status,
+          attempts: attempt,
+          error_type: "parse",
+        });
+      }
+      return {
+        model,
+        upstream_url,
+        status_code: response.status,
+        attempts: attempt,
+        executor_usage,
+        response_text,
+      };
     } catch (error) {
-      lastError = error;
-      if (!/fetch failed|network|ECONN|ENOTFOUND|ETIMEDOUT/i.test(error.message)) throw error;
-      break;
+      const enriched = enrichExecutionError(error, { model, upstream_url, attempts: attempt });
+      if (enriched.error_type === "timeout") {
+        enriched.message = `Upstream request timed out after ${executionTimeoutMs(config)}ms.`;
+        lastError = enriched;
+        if (attempt < 2) {
+          await sleep(config.verifyExecuteRetryBaseMs || 250);
+          continue;
+        }
+        enriched.error_type = "timeout_retry_exhausted";
+        enriched.message = `Upstream request timed out after ${executionTimeoutMs(config)}ms and retry was exhausted.`;
+        throw enriched;
+      }
+      lastError = enriched;
+      if (!["network", "429"].includes(enriched.error_type)) throw enriched;
+      if (enriched.error_type === "network") break;
     }
   }
   throw lastError;
@@ -489,6 +810,29 @@ async function callUpstreamExecutor({ item, config }) {
 
 function upstreamResponsesUrl(config) {
   return new URL("/v1/responses", config.upstreamBaseUrl);
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function executionTimeoutMs(config) {
+  const timeout = Number(config.verifyExecuteTimeoutMs);
+  return Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_EXECUTE_TIMEOUT_MS;
+}
+
+function safeUpstreamResponsesUrl(config) {
+  try {
+    return config.upstreamBaseUrl ? upstreamResponsesUrl(config).toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 function upstreamHeaders(config) {
@@ -503,6 +847,93 @@ function upstreamHeaders(config) {
   return headers;
 }
 
+function preflightExecuteConfig(config) {
+  const missing = [];
+  if (!config.upstreamBaseUrl) missing.push("upstreamBaseUrl");
+  if (!config.defaultTargetModel) missing.push("defaultTargetModel");
+  if (!hasUpstreamAuthorization(config)) missing.push("Authorization header or upstreamApiKey/apiKey/openaiApiKey/OPENAI_API_KEY");
+  if (!missing.length) return;
+  const error = new Error(`verify execute preflight failed: missing ${missing.join(", ")}.`);
+  error.error_type = "config";
+  throw error;
+}
+
+function hasUpstreamAuthorization(config) {
+  const headers = config.upstreamHeaders || {};
+  const hasAuthorization = Object.keys(headers).some(key => key.toLowerCase() === "authorization");
+  return Boolean(
+    hasAuthorization ||
+      config.upstreamApiKey ||
+      config.apiKey ||
+      config.openaiApiKey ||
+      process.env.OPENAI_API_KEY,
+  );
+}
+
+function executionError({ message, model, upstream_url, status_code = null, attempts = 0, error_type }) {
+  const error = new Error(message);
+  error.model = model;
+  error.upstream_url = upstream_url;
+  error.status_code = status_code;
+  error.attempts = attempts;
+  error.error_type = error_type;
+  return error;
+}
+
+function enrichExecutionError(error, { model, upstream_url, attempts }) {
+  if (error.error_type) {
+    error.model ||= model;
+    error.upstream_url ||= upstream_url;
+    error.attempts ||= attempts;
+    return error;
+  }
+  return executionError({
+    message: error.message,
+    model,
+    upstream_url,
+    attempts,
+    error_type: classifyExecutionError(error),
+  });
+}
+
+function httpStatusDiagnostic(status) {
+  if (status === 401) return "auth failure";
+  if (status === 404) return "endpoint mismatch";
+  if (status === 429) return "rate limit";
+  if (status >= 500) return "upstream failure";
+  return "upstream failure";
+}
+
+function isRetryableUpstreamStatus(status) {
+  return status >= 500 && status < 600;
+}
+
+function classifyExecutionError(error) {
+  if (error.error_type) return error.error_type;
+  if (error.status_code) return String(error.status_code);
+  if (/AbortError|aborted|abort/i.test(error.name || "") || /AbortError|aborted|abort/i.test(error.message)) return "timeout";
+  if (/missing user_excerpt/i.test(error.message)) return "missing_user_excerpt";
+  if (/non-JSON|JSON/i.test(error.message)) return "parse";
+  if (/fetch failed|network|ECONN|ENOTFOUND|ETIMEDOUT|ECONNREFUSED/i.test(error.message)) return "network";
+  return "upstream";
+}
+
+function executionErrorSummary(rows) {
+  const errors = rows.filter(row => row.error);
+  const errorsByType = {};
+  const distinctErrors = [];
+  const seen = new Set();
+  for (const row of errors) {
+    const type = row.error_type || classifyExecutionError(row);
+    errorsByType[type] = (errorsByType[type] || 0) + 1;
+    if (!seen.has(row.error)) {
+      seen.add(row.error);
+      if (distinctErrors.length < 3) distinctErrors.push(row.error);
+    }
+  }
+  return { distinct_errors: distinctErrors, errors_by_type: errorsByType };
+}
+
 function extractUsage(raw) {
   try {
     const parsed = JSON.parse(raw);
@@ -512,18 +943,183 @@ function extractUsage(raw) {
   }
 }
 
+function extractResponseText(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    const parts = [];
+    collectTextValue(parts, parsed.output_text);
+    collectTextValue(parts, parsed.response?.output_text);
+    collectTextValue(parts, parsed.message?.content);
+    collectTextValue(parts, parsed.choices?.map(choice => choice.message?.content));
+    collectOutputText(parts, parsed.output);
+    collectOutputText(parts, parsed.response?.output);
+    const text = parts.map(part => part.trim()).filter(Boolean).join("\n");
+    return text || null;
+  } catch {
+    throw new Error("Upstream returned non-JSON response.");
+  }
+}
+
+function collectOutputText(parts, output) {
+  if (!Array.isArray(output)) return;
+  for (const item of output) {
+    collectTextValue(parts, item?.text);
+    collectTextValue(parts, item?.content);
+  }
+}
+
+function collectTextValue(parts, value) {
+  if (typeof value === "string") {
+    parts.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectTextValue(parts, item);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  collectTextValue(parts, value.text);
+  collectTextValue(parts, value.value);
+  collectTextValue(parts, value.output_text);
+  collectTextValue(parts, value.refusal);
+}
+
+async function writeQualityLabels({ runDir, rows, plan, config }) {
+  const labelsPath = path.join(runDir, "quality-labels.jsonl");
+  const candidatePlanByRouteId = new Map(plan.filter(item => item.source === "candidate").map(item => [item.route_id, item]));
+  const rowByPlanKey = new Map(rows.map(row => [`${row.source}:${row.route_id}`, row]));
+  const candidatePlan = plan.filter(item => item.source === "candidate");
+  const labelRows = [];
+  writeJsonlRows(labelsPath, labelRows);
+  for (const planItem of candidatePlan) {
+    const row = rowByPlanKey.get(`candidate:${planItem.route_id}`);
+    if (!row) {
+      appendQualityLabel(labelRows, labelsPath, unjudgeableQualityLabel({
+        routeId: planItem.route_id,
+        judgeModel: judgeModelForConfig(config),
+        reason: "candidate execution row missing",
+        judgeError: "missing execution row",
+      }));
+      continue;
+    }
+    if (row.error) {
+      appendQualityLabel(labelRows, labelsPath, unjudgeableQualityLabel({
+        routeId: row.route_id,
+        judgeModel: judgeModelForConfig(config),
+        reason: "candidate execution error prevented judging",
+        judgeError: `execution_error: ${row.error_type || "unknown"}${row.error ? `: ${row.error}` : ""}`,
+      }));
+      continue;
+    }
+    if (!row.response_text) {
+      appendQualityLabel(labelRows, labelsPath, unjudgeableQualityLabel({
+        routeId: row.route_id,
+        judgeModel: judgeModelForConfig(config),
+        reason: "candidate response text missing",
+        judgeError: "missing response text",
+      }));
+      continue;
+    }
+    const sourcePlanItem = candidatePlanByRouteId.get(row.route_id) || planItem;
+    const result = await judgeRoute({
+      userExcerpt: sourcePlanItem?.user_excerpt || null,
+      responseText: row.response_text,
+      chosenEffort: row.effort,
+      config,
+    });
+    appendQualityLabel(labelRows, labelsPath, {
+      route_id: row.route_id,
+      acceptance_label: result.label,
+      signal: "quality_judge",
+      reason: result.reason,
+      judge_model: judgeModelForConfig(config),
+      judge_usage: result.usage,
+      judge_error: result.error,
+    });
+  }
+  return labelsPath;
+}
+
+function appendQualityLabel(labelRows, labelsPath, row) {
+  labelRows.push(row);
+  appendJsonlRow(labelsPath, row);
+}
+
+function unjudgeableQualityLabel({ routeId, judgeModel, reason, judgeError }) {
+  return {
+    route_id: routeId,
+    acceptance_label: "ambiguous",
+    signal: "quality_judge",
+    reason,
+    judge_model: judgeModel,
+    judge_usage: null,
+    judge_error: judgeError,
+  };
+}
+
+function updateMetricsWithQualityLabels(metrics, runDir, qualityLabelsPath = null) {
+  const labelsPath = qualityLabelsPath || readQualityLabels(runDir).path;
+  if (!labelsPath) return metrics;
+  const samplesPath = path.join(runDir, "samples.jsonl");
+  if (!fs.existsSync(samplesPath)) return metrics;
+  const qualityLabels = readJsonl(labelsPath).rows;
+  const labelMap = feedbackLabelMap(qualityLabels);
+  const samples = readJsonl(samplesPath).rows.map(row => ({
+    ...row,
+    acceptance_label: labelMap.get(row.route_id) || "ambiguous",
+  }));
+  return {
+    ...metrics,
+    verification: {
+      ...(metrics.verification || {}),
+      quality_labels_path: labelsPath,
+      quality_labels: qualityLabelSummary(qualityLabels),
+      optimization_segments: sampleOptimizationSegments(samples),
+    },
+  };
+}
+
+function qualityLabelSummary(rows = []) {
+  const summary = {
+    total: rows.length,
+    accepted: 0,
+    underfit: 0,
+    rejected: 0,
+    ambiguous: 0,
+    ambiguous_reasons: {},
+  };
+  for (const row of rows) {
+    if (row.acceptance_label === "accepted") summary.accepted += 1;
+    if (row.acceptance_label === "underfit") summary.underfit += 1;
+    if (row.acceptance_label === "rejected") summary.rejected += 1;
+    if (row.acceptance_label === "ambiguous") {
+      summary.ambiguous += 1;
+      const reason = normalizeAmbiguousReason(row);
+      summary.ambiguous_reasons[reason] = (summary.ambiguous_reasons[reason] || 0) + 1;
+    }
+  }
+  return summary;
+}
+
+function normalizeAmbiguousReason(row) {
+  const text = String(row.judge_error || row.reason || "ambiguous").trim();
+  const executionMatch = text.match(/^execution_error:\s*([^:]+)/);
+  if (executionMatch) return `execution_error: ${executionMatch[1].trim() || "unknown"}`;
+  return text || "ambiguous";
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConsidered }) {
-  const candidateRows = rows.filter(row => row.source === "candidate" && !row.error);
-  const baselineRows = rows.filter(row => row.source.startsWith("baseline_") && !row.error);
-  const actualCandidateTokens = sumUsageTokens(candidateRows.map(row => row.executor_usage));
-  const actualBaselineTokens = sumUsageTokens(baselineRows.map(row => row.executor_usage));
-  const exact = actualCandidateTokens !== null && actualBaselineTokens !== null;
+function updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConsidered, plan = null }) {
+  const pairing = executionPairingSummary({ rows, plan });
+  const errorSummary = executionErrorSummary(rows);
+  const actualCandidateTokens = sumUsageTokens(pairing.matched_pairs.map(pair => pair.candidate.executor_usage));
+  const actualBaselineTokens = sumUsageTokens(pairing.matched_pairs.map(pair => pair.baseline.executor_usage));
+  const exact = pairing.matched_success_pairs > 0 && actualCandidateTokens !== null && actualBaselineTokens !== null;
   const saved = exact ? Math.max(0, actualBaselineTokens - actualCandidateTokens) : null;
-  const baselineSources = [...new Set(baselineRows.map(row => row.source))].sort();
+  const baselineSources = pairing.baseline_sources;
   const updated = {
     ...metrics,
     verification: {
@@ -537,8 +1133,16 @@ function updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConside
       rows: rows.length,
       errors: rows.filter(row => row.error).length,
       baseline_sources: baselineSources,
+      execution_pairing: pairing.execution_pairing,
+      total_planned_pairs: pairing.total_planned_pairs,
+      matched_success_pairs: pairing.matched_success_pairs,
+      candidate_only_rows: pairing.candidate_only_rows,
+      baseline_only_rows: pairing.baseline_only_rows,
+      missing_usage_rows: pairing.missing_usage_rows,
       actual_candidate_tokens: actualCandidateTokens,
       actual_baseline_tokens: actualBaselineTokens,
+      distinct_errors: errorSummary.distinct_errors,
+      errors_by_type: errorSummary.errors_by_type,
     },
   };
 
@@ -551,18 +1155,166 @@ function updateMetricsWithExecution(metrics, rows, { resultsPath, samplesConside
     exact,
   };
   if (exact) {
-    updated.weakest_evidence = rows.some(row => row.error)
-      ? "Exact savings available for successful execution rows; some samples failed during counterfactual execution."
+    updated.weakest_evidence = pairing.execution_pairing === "contaminated"
+      ? `Exact savings limited to matched-success execution pairs (${pairing.matched_success_pairs}/${pairing.total_planned_pairs}); pairing is contaminated.`
       : "Exact savings available for sampled counterfactual executor calls.";
   }
   return updated;
+}
+
+function executionPairingSummary({ rows, plan = null }) {
+  const rowMap = new Map();
+  for (const row of rows) rowMap.set(planItemKey(row), row);
+  const pairs = plan ? executionPlanPairs(plan) : executionRowsPairs(rows);
+  let candidateOnlyRows = 0;
+  let baselineOnlyRows = 0;
+  let missingUsageRows = 0;
+  const matchedPairs = [];
+  const baselineSources = new Set();
+
+  for (const pair of pairs) {
+    baselineSources.add(pair.baseline.source);
+    const candidate = rowMap.get(planItemKey(pair.candidate));
+    const baseline = rowMap.get(planItemKey(pair.baseline));
+    const candidateSuccess = isMatchedExecutionSuccess(candidate);
+    const baselineSuccess = isMatchedExecutionSuccess(baseline);
+    if (hasMissingUsage(candidate)) missingUsageRows += 1;
+    if (hasMissingUsage(baseline)) missingUsageRows += 1;
+    if (candidateSuccess && baselineSuccess) {
+      matchedPairs.push({ candidate, baseline });
+      continue;
+    }
+    if (candidateSuccess && !baselineSuccess) candidateOnlyRows += 1;
+    if (!candidateSuccess && baselineSuccess) baselineOnlyRows += 1;
+  }
+
+  const totalPlannedPairs = pairs.length;
+  const matchedSuccessPairs = matchedPairs.length;
+  return {
+    total_planned_pairs: totalPlannedPairs,
+    matched_success_pairs: matchedSuccessPairs,
+    candidate_only_rows: candidateOnlyRows,
+    baseline_only_rows: baselineOnlyRows,
+    missing_usage_rows: missingUsageRows,
+    execution_pairing: totalPlannedPairs > 0 && matchedSuccessPairs === totalPlannedPairs ? "complete" : "contaminated",
+    baseline_sources: [...baselineSources].sort(),
+    matched_pairs: matchedPairs,
+  };
+}
+
+function executionPlanPairs(plan) {
+  return executionRouteGroups(plan).flatMap(group =>
+    group.baselines.map(baseline => ({
+      candidate: group.candidate,
+      baseline,
+    })),
+  );
+}
+
+function executionRowsPairs(rows) {
+  const byRoute = new Map();
+  for (const row of rows) {
+    const group = byRoute.get(row.route_id) || { candidate: null, baselines: [] };
+    if (row.source === "candidate") group.candidate = row;
+    if (row.source?.startsWith("baseline_")) group.baselines.push(row);
+    byRoute.set(row.route_id, group);
+  }
+  return [...byRoute.values()]
+    .filter(group => group.candidate && group.baselines.length)
+    .flatMap(group => group.baselines.map(baseline => ({ candidate: group.candidate, baseline })));
+}
+
+function isMatchedExecutionSuccess(row) {
+  if (!row || row.error) return false;
+  if (!Number.isFinite(row.status_code) || row.status_code < 200 || row.status_code >= 300) return false;
+  return usageTotalTokens(row.executor_usage) > 0;
+}
+
+function hasMissingUsage(row) {
+  if (!row || row.error) return false;
+  if (!Number.isFinite(row.status_code) || row.status_code < 200 || row.status_code >= 300) return false;
+  return !(usageTotalTokens(row.executor_usage) > 0);
+}
+
+function usageTotalTokens(usage) {
+  if (!usage) return null;
+  const value =
+    usage.total_tokens ??
+    usage.totalTokens ??
+    (Number.isFinite(usage.input_tokens) || Number.isFinite(usage.output_tokens)
+      ? (usage.input_tokens || 0) + (usage.output_tokens || 0)
+      : undefined);
+  return Number.isFinite(value) ? value : null;
 }
 
 function exactSavingsLabel(saved, baseline) {
   return saved !== null && baseline ? `${saved} tokens / ${((saved / baseline) * 100).toFixed(1)}%` : "baseline pending";
 }
 
-function computeGates({ manifest, metrics, config }) {
+function evidenceSummary({ runDir, manifest, metrics, config }) {
+  const samples = Number(metrics.verification?.samples ?? 0);
+  const sampleStatus = samples > 0 ? "ready" : "empty";
+  const missing = [];
+  const executionPath = path.join(runDir, "execution-results.jsonl");
+  const qualityLabelsPath = path.join(runDir, "quality-labels.jsonl");
+  if (!fs.existsSync(executionPath) || !metrics.execution) missing.push("execution_missing");
+  if (expectsQualityJudge({ config, metrics }) && (!fs.existsSync(qualityLabelsPath) || !qualityLabelsCoverSamples(runDir))) {
+    missing.push("judge_missing");
+  }
+  const pairingRatio = executionPairingRatio(metrics.execution);
+  const pairingContaminated = metrics.execution && pairingRatio !== null && pairingRatio < 0.8;
+  const evidenceStatus = missing.length ? "incomplete" : pairingContaminated ? "partial" : "complete";
+  const claimStatus = evidenceStatus === "complete" && metrics.savings?.exact === true ? "proven" : "not_proven";
+  const pairingMissing = pairingContaminated ? ["execution_pairing_contaminated"] : [];
+  return {
+    evidence_status: evidenceStatus,
+    sample_status: sampleStatus,
+    claim_status: claimStatus,
+    execution_pairing: metrics.execution?.execution_pairing ?? null,
+    execution_pairing_ratio: pairingRatio,
+    missing: [...missing, ...pairingMissing],
+    reason: evidenceReason([...missing, ...pairingMissing], metrics),
+  };
+}
+
+function expectsQualityJudge({ config, metrics }) {
+  if (config.enableQualityJudge === false) return false;
+  return Number(metrics.verification?.samples ?? 0) > 0;
+}
+
+function qualityLabelsCoverSamples(runDir) {
+  const samplesPath = path.join(runDir, "samples.jsonl");
+  const labelsPath = path.join(runDir, "quality-labels.jsonl");
+  if (!fs.existsSync(samplesPath) || !fs.existsSync(labelsPath)) return false;
+  const samples = readJsonl(samplesPath).rows;
+  const labels = readJsonl(labelsPath).rows;
+  const labeledRouteIds = new Set(labels.map(row => row.route_id).filter(Boolean));
+  return samples.every(row => labeledRouteIds.has(row.route_id));
+}
+
+function evidenceReason(missing, metrics) {
+  if (missing.includes("execution_pairing_contaminated")) {
+    return `execution pairing contaminated; exact savings limited to ${metrics.execution?.matched_success_pairs ?? 0}/${metrics.execution?.total_planned_pairs ?? 0} matched-success pairs`;
+  }
+  const hasExecution = !missing.includes("execution_missing");
+  const hasJudge = !missing.includes("judge_missing");
+  if (hasExecution && hasJudge) {
+    return metrics.savings?.exact === true ? "exact execution and judge labels available" : "evidence available but exact savings not proven";
+  }
+  if (!hasExecution && !hasJudge) return "execution preflight failed; no exact execution or judge labels available";
+  if (!hasExecution) return "execution preflight failed; no exact execution available";
+  return "judge labels unavailable";
+}
+
+function executionPairingRatio(execution) {
+  if (!execution) return null;
+  const matched = Number(execution.matched_success_pairs);
+  const total = Number(execution.total_planned_pairs);
+  if (!Number.isFinite(matched) || !Number.isFinite(total) || total <= 0) return null;
+  return matched / total;
+}
+
+function computeGates({ manifest, metrics, config, evidence = null }) {
   const gates = manifest.gates || DEFAULT_GATES;
   const validity = Number(metrics.routes?.validity_percent) / 100;
   const underfitRate = parsePercent(metrics.outcomes?.underfit_rate);
@@ -571,6 +1323,11 @@ function computeGates({ manifest, metrics, config }) {
   const exactSavingsAvailable = metrics.savings?.exact === true;
   const savingsRatio = executionAttempted && !exactSavingsAvailable ? null : savingsGateRatio(metrics);
   const telemetryOk = metrics.verification?.telemetry_preconditions?.ok !== false;
+  const evidenceState = evidence || {
+    evidence_status: "unknown",
+    missing: [],
+    reason: null,
+  };
   return [
     {
       name: "telemetry_preconditions",
@@ -610,12 +1367,21 @@ function computeGates({ manifest, metrics, config }) {
       pass: executionAttempted && !exactSavingsAvailable ? false : savingsRatio === null || savingsRatio >= gates.min_net_savings_ratio,
       reason: executionAttempted && !exactSavingsAvailable ? "exact execution savings unavailable" : null,
     },
+    {
+      name: "evidence_complete",
+      severity: "soft",
+      observed: evidenceState.evidence_status,
+      threshold: "complete",
+      pass: evidenceState.evidence_status === "complete",
+      missing: evidenceState.missing,
+      reason: evidenceState.evidence_status === "complete" ? null : evidenceState.reason,
+    },
     humanReviewQueueGate(config),
   ];
 }
 
 function savingsGateRatio(metrics) {
-  if (!metrics.savings?.estimated_tokens_saved || !metrics.savings?.estimated_xhigh_baseline_tokens) return null;
+  if (metrics.savings?.estimated_tokens_saved == null || metrics.savings?.estimated_xhigh_baseline_tokens == null) return null;
   return metrics.savings.estimated_tokens_saved / metrics.savings.estimated_xhigh_baseline_tokens;
 }
 
@@ -656,4 +1422,79 @@ function unique(values) {
 
 function formatMaybeNumber(value) {
   return Number.isFinite(value) ? value.toFixed(1) : "baseline pending";
+}
+
+function executionPairingReportLine(metrics) {
+  const execution = metrics.execution || {};
+  if (!Number.isFinite(execution.matched_success_pairs) || !Number.isFinite(execution.total_planned_pairs)) {
+    return "Execution pairing: baseline pending";
+  }
+  return `Execution pairing: ${execution.matched_success_pairs} matched-success pairs / ${execution.total_planned_pairs} total planned`;
+}
+
+function savingsBasisLabel(metrics) {
+  const execution = metrics.execution || {};
+  if (!metrics.savings?.exact) return "baseline pending";
+  if (!Number.isFinite(execution.matched_success_pairs) || !Number.isFinite(execution.total_planned_pairs)) {
+    return "matched-success pairs only";
+  }
+  return `matched-success pairs only (${execution.matched_success_pairs}/${execution.total_planned_pairs})`;
+}
+
+function formatOptimizationSegments(segments = {}) {
+  return OPTIMIZATION_SEGMENTS.map(name => {
+    const segment = segments[name] || {};
+    return `- ${name}: count ${segment.count ?? 0}, underfit ${segment.underfit_rate ?? "baseline pending"}, rejection ${segment.rejection_rate ?? "baseline pending"}, acceptance ${segment.acceptance_rate ?? "baseline pending"}`;
+  });
+}
+
+function formatQualityLabelSummary(summary) {
+  if (!summary) return "baseline pending";
+  return `accepted ${summary.accepted ?? 0}, underfit ${summary.underfit ?? 0}, rejected ${summary.rejected ?? 0}, ambiguous ${summary.ambiguous ?? 0}`;
+}
+
+function formatAmbiguousReasons(summary) {
+  const reasons = summary?.ambiguous_reasons || {};
+  const entries = Object.entries(reasons).sort(([a], [b]) => a.localeCompare(b));
+  if (!entries.length) return [];
+  return [
+    `Ambiguous reasons:`,
+    ...entries.map(([reason, count]) => `- ${reason}: ${count}`),
+  ];
+}
+
+function sampleOptimizationSegments(rows = []) {
+  const segments = Object.fromEntries(
+    OPTIMIZATION_SEGMENTS.map(segment => [
+      segment,
+      {
+        count: 0,
+        accepted: 0,
+        underfit: 0,
+        rejected: 0,
+        ambiguous: 0,
+        underfit_rate: "baseline pending",
+        rejection_rate: "baseline pending",
+        acceptance_rate: "baseline pending",
+      },
+    ]),
+  );
+
+  for (const row of rows) {
+    const segmentName = classifyOptimizationSegment(row);
+    const segment = segments[segmentName] || segments.effort_sensitive;
+    const label = row.acceptance_label;
+    segment.count += 1;
+    if (label === "accepted") segment.accepted += 1;
+    if (label === "underfit") segment.underfit += 1;
+    if (label === "rejected") segment.rejected += 1;
+    if (label === "ambiguous") segment.ambiguous += 1;
+  }
+
+  for (const segment of Object.values(segments)) {
+    segment.underfit_rate = percent(segment.underfit, segment.count);
+    segment.rejection_rate = percent(segment.rejected + segment.ambiguous, segment.count);
+    segment.acceptance_rate = percent(segment.accepted, segment.count);
+  }
+  return segments;
 }

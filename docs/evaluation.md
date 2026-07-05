@@ -32,7 +32,10 @@ Every route should log:
   "profile_segment": "string",
   "risk_tier": "low|medium|high|unknown",
   "language": "string",
-  "request_class": "string",
+  "request_class": "codex_suggestions|session_restore|memory_extraction|coding_help|other",
+  "connected_app_required": false,
+  "memory_lookup_needed": false,
+  "optimization_segment": "effort_sensitive|capability_sensitive",
   "router_model": "string",
   "router_effort": "string",
   "router_confidence": 0.0,
@@ -107,7 +110,11 @@ npm run cli -- verify report --id peto-verify-run
 
 The CLI should not claim exact savings without real counterfactual xhigh runs. When logs do not contain enough usage or feedback data, it must say `baseline pending` and name the missing evidence.
 
+`optimization_segment` is a reporting-only derived field. `codex_suggestions` requests that require connected app context are `capability_sensitive`; all other traffic is `effort_sensitive`. This segmentation makes PETO's effort-routing performance legible without changing routing behavior.
+
 `peto verify` writes deterministic offline verification artifacts under `memory/verification/runs/<run_id>/`. V1 verification runs the candidate router and fixed baselines over logged samples only; it does not execute user requests or invoke RouteLLM unless a later explicit comparator ticket adds that behavior.
+
+Verification tickets may set `segment_filter` to `all`, `effort_sensitive`, or `capability_sensitive`. They may set `sample_mode` to `representative` or `stress`. Representative samples are seeded random samples from the selected segment and are claim-grade. Stress samples preserve the failure-biased underfit/rejected sampling behavior and are stress-grade for failure analysis.
 
 ## Agent-Orchestrated Verification
 

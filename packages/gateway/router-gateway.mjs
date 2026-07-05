@@ -5,6 +5,7 @@ import path from "node:path";
 import { URL } from "node:url";
 import crypto from "node:crypto";
 
+import { classifyRequestTelemetry } from "../core/telemetry.mjs";
 import { parseSseUsage } from "../core/sse.mjs";
 
 const defaultConfigPath = path.resolve("peto.config.json");
@@ -367,6 +368,10 @@ function detectDispleasure(text) {
 
 function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSourceDetail, routeUsage, notes }) {
   const logPath = config.logPath || path.join(memoryPath, "dispatcher/logs/router-events.jsonl");
+  const requestTelemetry = classifyRequestTelemetry({
+    request_class: config.defaultRequestClass,
+    user_excerpt: userText,
+  });
   appendJsonl(logPath, {
     id,
     route_id: id,
@@ -391,7 +396,9 @@ function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSo
     profile_segment: config.defaultProfileSegment || "default",
     risk_tier: config.defaultRiskTier || "unknown",
     language: config.defaultLanguage || "unknown",
-    request_class: config.defaultRequestClass || "unknown",
+    request_class: requestTelemetry.request_class,
+    connected_app_required: requestTelemetry.connected_app_required,
+    memory_lookup_needed: requestTelemetry.memory_lookup_needed,
     acceptance_label: null,
     annotations: [],
     retrieved_notes: notes.map(note => note.file),
