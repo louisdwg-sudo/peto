@@ -1,2 +1,5 @@
 *.zip
 
+
+# Private traffic logs and verification run data — never publish
+memory/
