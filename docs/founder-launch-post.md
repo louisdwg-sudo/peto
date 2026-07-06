@@ -44,7 +44,7 @@ It doesn't work on everything. The documentation says so plainly.
 
 If you're paying real API bills and you've wondered whether all that reasoning was actually necessary — the repo is open, MIT licensed, and you can run the verification on your own logs.
 
-**[github.com/your-repo]** — and if the measurement methodology interests you more than the savings number, that's probably a sign you should try it.
+**[github.com/louisdwg-sudo/peto](https://github.com/louisdwg-sudo/peto)** — and if the measurement methodology interests you more than the savings number, that's probably a sign you should try it.
 
 ---
 
