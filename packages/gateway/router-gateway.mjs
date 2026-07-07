@@ -366,6 +366,57 @@ function detectDispleasure(text) {
   return patterns.some(pattern => pattern.test(lowered)) && aimedAtAssistant.some(pattern => pattern.test(text));
 }
 
+// ---------------------------------------------------------------------------
+// Effort footer — appended to every response so the UI shows routing metadata.
+// Disable with "enableEffortFooter": false in peto.config.json.
+// ---------------------------------------------------------------------------
+
+function estimateSavings(chosen, incoming) {
+  const levels = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4 };
+  const chosenLevel = levels[chosen] ?? 2;
+  const incomingLevel = levels[incoming] ?? 4;
+  if (chosenLevel >= incomingLevel) return "none (pass-through)";
+  const map = { 0: "~75%", 1: "~60%", 2: "~40%", 3: "~20%" };
+  return map[chosenLevel] ?? "baseline pending";
+}
+
+function buildEffortFooter(route, incomingEffort) {
+  if (config.enableEffortFooter === false) return null;
+  const chosen = route.target_effort || "unknown";
+  const confidence = route.confidence ?? 0;
+  const fit = confidence >= 0.7 ? "appropriate" : confidence >= 0.5 ? "uncertain" : "low confidence";
+  const savings = estimateSavings(chosen, incomingEffort || "xhigh");
+  const review = route.needs_review
+    ? "flagged for review"
+    : confidence >= 0.7
+    ? "appropriate, no lesson."
+    : "uncertain routing — monitor.";
+  return [
+    `Effort: ${chosen}`,
+    `Effort fit: ${fit}`,
+    `Estimated xhigh savings: ${savings}`,
+    `Effort review: ${review}`,
+  ].join("\n");
+}
+
+function injectFooterIntoJsonResponse(body, footer) {
+  const next = structuredClone(body);
+  const output = next?.output;
+  if (!Array.isArray(output)) return next;
+  for (let i = output.length - 1; i >= 0; i -= 1) {
+    const content = output[i]?.content;
+    if (!Array.isArray(content)) continue;
+    for (let j = content.length - 1; j >= 0; j -= 1) {
+      const part = content[j];
+      if (part?.type === "output_text" && typeof part.text === "string") {
+        part.text = `${part.text}\n\n${footer}`;
+        return next;
+      }
+    }
+  }
+  return next;
+}
+
 function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSourceDetail, routeUsage, notes }) {
   const logPath = config.logPath || path.join(memoryPath, "dispatcher/logs/router-events.jsonl");
   const requestTelemetry = classifyRequestTelemetry({
@@ -433,7 +484,7 @@ function logRouteComplete({ id, status, statusCode, latencyMs, usage, error }) {
   });
 }
 
-async function forwardToUpstream(req, res, body) {
+async function forwardToUpstream(req, res, body, { footer } = {}) {
   const started = Date.now();
   const url = upstreamUrl(req.url);
   const upstreamHeaders = {
@@ -458,11 +509,42 @@ async function forwardToUpstream(req, res, body) {
   const contentType = response.headers.get("content-type") || "";
   if (contentType.includes("text/event-stream") && response.body) {
     let streamText = "";
+    // Track the last item_id and sequence_number seen in the stream so we can
+    // inject a footer delta event after the upstream stream finishes.
+    let lastItemId = null;
+    let lastSeqNum = 0;
+
     for await (const chunk of response.body) {
       const buffer = Buffer.from(chunk);
-      streamText += buffer.toString("utf8");
+      const chunkText = buffer.toString("utf8");
+      streamText += chunkText;
+      // Best-effort parse of each SSE data line to track stream metadata.
+      for (const line of chunkText.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        try {
+          const event = JSON.parse(line.slice(5).trim());
+          if (typeof event.item_id === "string") lastItemId = event.item_id;
+          if (typeof event.sequence_number === "number") lastSeqNum = event.sequence_number;
+        } catch {
+          // Ignore non-JSON or partial data lines.
+        }
+      }
       res.write(buffer);
     }
+
+    // Append the effort footer as a final text delta before closing the stream.
+    if (footer && lastItemId) {
+      const deltaEvent = {
+        type: "response.output_text.delta",
+        sequence_number: lastSeqNum + 1,
+        item_id: lastItemId,
+        output_index: 0,
+        content_index: 0,
+        delta: `\n\n${footer}`,
+      };
+      res.write(`event: response.output_text.delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`);
+    }
+
     res.end();
     return {
       statusCode: response.status,
@@ -472,12 +554,19 @@ async function forwardToUpstream(req, res, body) {
   }
 
   const raw = await response.text();
-  res.end(raw);
   let usage = null;
   try {
-    usage = JSON.parse(raw)?.usage ?? null;
+    const parsed = JSON.parse(raw);
+    usage = parsed?.usage ?? null;
+    // Inject footer into the response body text before sending.
+    if (footer && parsed) {
+      res.end(JSON.stringify(injectFooterIntoJsonResponse(parsed, footer)));
+    } else {
+      res.end(raw);
+    }
   } catch {
-    // Ignore non-JSON response.
+    // Non-JSON response — forward as-is.
+    res.end(raw);
   }
   return {
     statusCode: response.status,
@@ -524,10 +613,11 @@ async function handleResponses(req, res) {
   }
 
   const routedBody = applyRoute(originalBody, route);
+  const footer = buildEffortFooter(route, originalBody.reasoning?.effort);
   logRouteStart({ id, userText, incomingBody: originalBody, route, routeSource, routeSourceDetail, routeUsage, notes });
 
   try {
-    const complete = await forwardToUpstream(req, res, routedBody);
+    const complete = await forwardToUpstream(req, res, routedBody, { footer });
     logRouteComplete({ id, status: "success", ...complete });
   } catch (error) {
     logRouteComplete({ id, status: "error", latencyMs: null, error: error.message });
