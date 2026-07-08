@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-ALLOWED_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"]
+ALLOWED_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"]
 MODEL = None
 TOKENIZER = None
 TORCH = None
@@ -193,6 +193,7 @@ def build_prompt(*, user_text: str, notes: list[Any], allowed: list[str]) -> str
         "medium: normal coding, editing, planning, repo maintenance.\n"
         "high: complex debugging, architecture, research synthesis, evaluation design, high-risk work.\n"
         "xhigh: rare deep multi-step work where rework is very expensive.\n"
+        "max: only for providers whose scale exceeds xhigh; reserve for the very hardest reasoning.\n"
         "Reply with exactly one allowed label and no other text."
         f"{notes_text}\n"
         f"User request:\n{user_text[:2200]}\n"
@@ -226,7 +227,7 @@ def qwen_label_route(effort: str, allowed: list[str]) -> dict[str, Any]:
         "target_effort": effort,
         "confidence": 0.62,
         "rationale_short": f"Local Qwen selected {effort}.",
-        "recording_priority": "watch" if effort in {"high", "xhigh"} else "normal",
+        "recording_priority": "watch" if effort in {"high", "xhigh", "max"} else "normal",
         "needs_review": False,
     }
 

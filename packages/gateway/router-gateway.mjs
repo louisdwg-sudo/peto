@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 
 import { classifyRequestTelemetry } from "../core/telemetry.mjs";
 import { parseSseUsage } from "../core/sse.mjs";
+import { applyEffortToBody, detectProvider, readIncomingEffort } from "../core/effort.mjs";
 
 const defaultConfigPath = path.resolve("peto.config.json");
 const configPath = process.env.PETO_CONFIG
@@ -318,15 +319,15 @@ async function callRouter({ headers, userText, notes }) {
   return callHostedRouter({ headers, userText, notes });
 }
 
-function applyRoute(body, route) {
-  const next = structuredClone(body);
-  const incomingModel = typeof next.model === "string" ? next.model : config.defaultTargetModel;
-  next.model = config.mode === "effort_only" ? incomingModel : config.defaultTargetModel;
-  next.reasoning = {
-    ...(next.reasoning || {}),
-    effort: route.target_effort || config.defaultEffort || "medium",
-  };
-  return next;
+function applyRoute(body, route, provider) {
+  const withModel = structuredClone(body);
+  const incomingModel = typeof withModel.model === "string" ? withModel.model : config.defaultTargetModel;
+  withModel.model = config.mode === "effort_only" ? incomingModel : config.defaultTargetModel;
+  // Translate the chosen effort tier into the detected provider's native field
+  // (OpenAI reasoning.effort / Anthropic thinking.budget_tokens / Gemini
+  // thinkingConfig.thinkingBudget).
+  const effort = route.target_effort || config.defaultEffort || "medium";
+  return applyEffortToBody(withModel, effort, provider, config);
 }
 
 function detectDispleasure(text) {
@@ -372,11 +373,11 @@ function detectDispleasure(text) {
 // ---------------------------------------------------------------------------
 
 function estimateSavings(chosen, incoming) {
-  const levels = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4 };
+  const levels = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, max: 5 };
   const chosenLevel = levels[chosen] ?? 2;
   const incomingLevel = levels[incoming] ?? 4;
   if (chosenLevel >= incomingLevel) return "none (pass-through)";
-  const map = { 0: "~75%", 1: "~60%", 2: "~40%", 3: "~20%" };
+  const map = { 0: "~75%", 1: "~60%", 2: "~40%", 3: "~20%", 4: "~5%" };
   return map[chosenLevel] ?? "baseline pending";
 }
 
@@ -417,7 +418,7 @@ function injectFooterIntoJsonResponse(body, footer) {
   return next;
 }
 
-function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSourceDetail, routeUsage, notes }) {
+function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSourceDetail, routeUsage, notes, provider, incomingEffort }) {
   const logPath = config.logPath || path.join(memoryPath, "dispatcher/logs/router-events.jsonl");
   const requestTelemetry = classifyRequestTelemetry({
     request_class: config.defaultRequestClass,
@@ -434,7 +435,8 @@ function logRouteStart({ id, userText, incomingBody, route, routeSource, routeSo
     input_hash: hashText(userText),
     user_excerpt: userText.slice(0, 500),
     incoming_model: incomingBody.model ?? null,
-    incoming_effort: incomingBody.reasoning?.effort ?? null,
+    incoming_effort: incomingEffort ?? incomingBody.reasoning?.effort ?? null,
+    upstream_provider: provider ?? null,
     chosen_model: incomingBody.model ?? config.defaultTargetModel,
     chosen_effort: route.target_effort,
     router_model: config.routerModel,
@@ -612,9 +614,13 @@ async function handleResponses(req, res) {
     logServer("router call failed", { id, error: error.message });
   }
 
-  const routedBody = applyRoute(originalBody, route);
-  const footer = buildEffortFooter(route, originalBody.reasoning?.effort);
-  logRouteStart({ id, userText, incomingBody: originalBody, route, routeSource, routeSourceDetail, routeUsage, notes });
+  const provider = detectProvider(config, originalBody);
+  const routedBody = applyRoute(originalBody, route, provider);
+  const incomingEffort = readIncomingEffort(originalBody, provider);
+  // Footer injection is built on the OpenAI SSE/JSON response shape. For other
+  // providers it would risk corrupting the stream, so only build it for OpenAI.
+  const footer = provider === "openai" ? buildEffortFooter(route, incomingEffort) : null;
+  logRouteStart({ id, userText, incomingBody: originalBody, route, routeSource, routeSourceDetail, routeUsage, notes, provider, incomingEffort });
 
   try {
     const complete = await forwardToUpstream(req, res, routedBody, { footer });

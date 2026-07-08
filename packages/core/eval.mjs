@@ -78,7 +78,9 @@ export function effortDistribution(routes) {
 }
 
 export function estimateXhighBaseline(routes, actualTokens) {
-  const multipliers = { minimal: 3.5, low: 3, medium: 2.2, high: 1.45, xhigh: 1 };
+  // xhigh is the savings baseline (1.0). `max` reasons deeper than the baseline,
+  // so it carries a below-1 multiplier (costs more than the xhigh reference).
+  const multipliers = { minimal: 3.5, low: 3, medium: 2.2, high: 1.45, xhigh: 1, max: 0.8 };
   let weighted = 0;
   let totalWeight = 0;
   for (const { request } of routes) {

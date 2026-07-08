@@ -28,7 +28,7 @@ So I built what I didn't want to build: a full verification harness. Run the sam
 
 Three things surprised me along the way.
 
-Measuring honestly makes your claim smaller. Some requests can't be tested fairly offline — anything that needs live files, ongoing sessions, or local state. I had to exclude them. The honest scope is narrower than I originally wanted. But narrower and true beats broader and wrong.
+Measuring honestly narrows what you can *prove*, not what works. Some requests can't be replayed fairly offline — anything that needs live files, ongoing sessions, or local state. I excluded them from the proof. Not because PETO doesn't help there — it probably helps more, since those are the expensive tasks — but because you can't faithfully re-run them after the fact. I'd rather report the number I can defend than the one I can't.
 
 What counts as "good enough" is personal. External benchmarks told me nothing useful. The only signal that matters is whether your specific user, in their specific context, accepted the output. That can't be downloaded. It has to be collected from your own traffic. The longer you run PETO, the more it learns about your patterns — not some average user's.
 
@@ -40,7 +40,7 @@ The data ends up being more valuable than the routing. The routing algorithm is 
 
 After all that: roughly 17.6% real token savings on real traffic, on requests where reasoning depth was the actual variable, with quality verified by an automated judge on matched pairs. Not estimated from a benchmark. Measured by running the same requests both ways.
 
-It doesn't work on everything. The documentation says so plainly.
+The proven number covers only what can be measured cleanly. The documentation says exactly what's in and out of scope, and why.
 
 If you're paying real API bills and you've wondered whether all that reasoning was actually necessary — the repo is open, MIT licensed, and you can run the verification on your own logs.
 

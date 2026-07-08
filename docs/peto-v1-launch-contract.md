@@ -11,19 +11,20 @@ Proof reference:
 - Verdict: promote
 - All gates passed
 
-## What PETO V1 does not claim
+## What is outside the proof (not outside PETO)
 
-PETO V1 makes no savings or quality claim for:
+PETO V1 makes no *measured* savings or quality claim for the request types below. This is a measurement limitation, not a capability limitation — these tasks can't be faithfully replayed offline, so matched-pair proof isn't possible. PETO likely still saves on them (often more, since they are the expensive tasks); we simply cannot prove it with this method yet.
 
 - capability_sensitive traffic (codex_suggestions + connected_app_required)
 - action_or_recovery_required prompts
 - local_artifact_required prompts
 - tool_execution_required or workspace_action_required tasks
-- Model selection (that is RouteLLM's scope, not PETO's)
+
+Model selection is genuinely out of scope — that is RouteLLM's job, not PETO's.
 
 ## Proof-eligible slice definition
 
-A route is proof-eligible if:
+A route is proof-eligible (i.e. measurable with matched-pair counterfactuals) if:
 
 - optimization_segment = effort_sensitive
 - tool_execution_required = false

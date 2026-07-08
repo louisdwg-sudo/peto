@@ -59,6 +59,18 @@ Upstream model (Claude, GPT, Gemini, local)
 
 The dispatcher runs locally (Qwen3-1.7B on Apple Silicon) or via any cheap hosted API. No data leaves your machine unless you configure a hosted router.
 
+### Provider-aware effort translation
+
+The effort scale has six tiers: `minimal / low / medium / high / xhigh / max`. The gateway detects the upstream provider and injects the chosen tier into that provider's native field:
+
+| Provider | Field injected |
+|---|---|
+| OpenAI / Codex | `reasoning.effort` (enum; `max` clamps to `xhigh`) |
+| Anthropic / Claude | `thinking.budget_tokens` (token budget; `minimal` disables thinking) |
+| Gemini | `generationConfig.thinkingConfig.thinkingBudget` (token budget; `max` → `-1` dynamic) |
+
+Detection uses `upstreamProvider` in config if set, otherwise the upstream URL, otherwise the request body shape. Per-tier token budgets for budget-based providers are configurable via `effortBudgets` in `peto.config.json`. The response footer (effort disclosure) is injected only for OpenAI-shaped responses today.
+
 ---
 
 ## Packages
@@ -100,6 +112,17 @@ skills/peto-effort-router/SKILL.md
 ```
 
 Teaches the agent to pre-route effort, post-review its own responses, and log acceptance signals.
+
+## Agent compatibility
+
+PETO includes repo-level instructions for common coding agents:
+
+- `AGENTS.md` - canonical instructions for Codex, Claude Code, Gemini, Cursor, Copilot, and other agents
+- `CLAUDE.md` - Claude Code entrypoint
+- `GEMINI.md` - Gemini CLI entrypoint
+- `.github/copilot-instructions.md` - GitHub Copilot entrypoint
+- `.cursor/rules/peto.mdc` - Cursor project rule
+- `.claude/skills/peto-effort-router/SKILL.md` - Claude Code project skill adapter
 
 ---
 

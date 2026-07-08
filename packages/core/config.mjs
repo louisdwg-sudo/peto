@@ -3,7 +3,9 @@ import path from "node:path";
 
 import { readJson } from "./jsonl.mjs";
 
-export const EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
+// `max` sits above `xhigh` for providers (e.g. Claude) whose reasoning scale
+// extends past OpenAI's ceiling. `xhigh` remains the savings baseline.
+export const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
 export const DEFAULT_CONFIG = {
   memoryPath: "./memory",
