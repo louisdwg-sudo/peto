@@ -3,3 +3,6 @@
 
 # Private traffic logs and verification run data — never publish
 memory/
+peto.codex.config.json
+.claude/
+.cursor/
